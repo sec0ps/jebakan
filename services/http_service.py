@@ -16,31 +16,50 @@ from typing import Dict, List, Any, Tuple, Optional
 
 from services.base_service import BaseService
 
+
+#!/usr/bin/env python3
+"""
+HTTP service emulator for the honeypot system
+"""
+
+import socket
+import threading
+import logging
+import datetime
+import json
+import os
+import time
+import re
+from urllib.parse import unquote, urlparse, parse_qs
+from typing import Dict, List, Any, Tuple, Optional
+
+from services.base_service import BaseService
+
 class HTTPService(BaseService):
     """HTTP service emulator for the honeypot"""
-    
+
     def __init__(self, host: str, port: int, config: Dict[str, Any]):
         """
         Initialize the HTTP service
-        
+
         Args:
             host: Host IP to bind to
             port: Port to listen on
             config: Global configuration dictionary
         """
         super().__init__(host, port, config, "http")
-        
+
         # Set up HTTP server
         self.server_name = self.service_config.get("server_name", "Apache/2.4.41 (Ubuntu)")
         self.webroot = self.service_config.get("webroot", "data/http")
-        
+
         # Create webroot directory if it doesn't exist
         os.makedirs(self.webroot, exist_ok=True)
-        
+
         # Ensure default index.html exists
         self._ensure_default_pages()
-        
-        # Track suspicious requests
+
+        # Track suspicious patterns
         self.suspicious_patterns = [
             r"/admin",
             r"/manager",
@@ -63,7 +82,7 @@ class HTTPService(BaseService):
             r"<script",  # XSS
             r"etc/passwd",  # LFI
         ]
-    
+
     def _ensure_default_pages(self) -> None:
         """
         Ensure default web pages exist in webroot
@@ -105,7 +124,7 @@ class HTTPService(BaseService):
 </body>
 </html>
 """)
-        
+
         # Create login.php - a fake login page
         login_path = os.path.join(self.webroot, "login.php")
         if not os.path.exists(login_path):
@@ -184,11 +203,11 @@ class HTTPService(BaseService):
 </body>
 </html>
 """)
-        
+
         # Create admin directory with fake admin panel
         admin_dir = os.path.join(self.webroot, "admin")
         os.makedirs(admin_dir, exist_ok=True)
-        
+
         admin_index = os.path.join(admin_dir, "index.php")
         if not os.path.exists(admin_index):
             with open(admin_index, "w") as f:
@@ -272,12 +291,12 @@ class HTTPService(BaseService):
 </body>
 </html>
 """)
-    
-    def handle_client(self, client_socket: socket.socket, address: Tuple[str, int], 
+
+    def handle_client(self, client_socket: socket.socket, address: Tuple[str, int],
                      connection_data: Dict[str, Any]) -> None:
         """
         Handle a client connection to the HTTP service
-        
+
         Args:
             client_socket: Client socket object
             address: Client address tuple (ip, port)
@@ -290,18 +309,18 @@ class HTTPService(BaseService):
                 chunk = client_socket.recv(4096)
                 if not chunk:
                     break
-                
+
                 request_data += chunk
-                
+
                 # Check if we've received the end of the headers
                 if b"\r\n\r\n" in request_data:
                     # If this is not a POST request, we're done
                     if not request_data.startswith(b"POST"):
                         break
-                    
+
                     # For POST requests, check if we've received the full body
                     headers, body = request_data.split(b"\r\n\r\n", 1)
-                    
+
                     # Check for Content-Length header
                     match = re.search(rb"Content-Length: (\d+)", headers)
                     if match:
@@ -311,62 +330,62 @@ class HTTPService(BaseService):
                     else:
                         # No Content-Length header, we're done
                         break
-            
+
             # Parse the HTTP request
             if not request_data:
                 return
-            
+
             connection_data["data"]["raw_request"] = request_data.decode('utf-8', errors='ignore')
-            
+
             # Extract request line
             request_lines = request_data.decode('utf-8', errors='ignore').split("\r\n")
             if not request_lines:
                 return
-            
+
             request_line = request_lines[0]
             connection_data["data"]["request_line"] = request_line
-            
+
             # Parse request line
             parts = request_line.split()
             if len(parts) < 3:
                 self._send_error(client_socket, 400, "Bad Request")
                 return
-            
+
             method, path, protocol = parts
             connection_data["data"]["method"] = method
             connection_data["data"]["path"] = path
             connection_data["data"]["protocol"] = protocol
-            
+
             # Parse headers
             headers = {}
             for line in request_lines[1:]:
                 if not line:
                     break
-                
+
                 if ":" in line:
                     key, value = line.split(":", 1)
                     headers[key.strip()] = value.strip()
-            
+
             connection_data["data"]["headers"] = headers
-            
+
             # Extract user-agent if present
             if "User-Agent" in headers:
                 connection_data["data"]["user_agent"] = headers["User-Agent"]
-            
+
             # Check for suspicious patterns in the request
             suspicious = False
             matched_patterns = []
-            
+
             for pattern in self.suspicious_patterns:
                 if re.search(pattern, path, re.IGNORECASE):
                     suspicious = True
                     matched_patterns.append(pattern)
-            
+
             if suspicious:
                 connection_data["data"]["suspicious"] = True
                 connection_data["data"]["matched_patterns"] = matched_patterns
                 self.logger.warning(f"Suspicious HTTP request from {address[0]}: {path} - matched patterns: {matched_patterns}")
-            
+
             # Handle the request based on method
             if method == "GET":
                 self._handle_get_request(client_socket, path, headers, connection_data)
@@ -375,7 +394,7 @@ class HTTPService(BaseService):
                 post_data = {}
                 if len(request_lines) > 1 and request_data.find(b"\r\n\r\n") != -1:
                     body = request_data.split(b"\r\n\r\n", 1)[1].decode('utf-8', errors='ignore')
-                    
+
                     # Simple parsing of application/x-www-form-urlencoded data
                     if "Content-Type" in headers and headers["Content-Type"] == "application/x-www-form-urlencoded":
                         post_params = body.split("&")
@@ -383,13 +402,13 @@ class HTTPService(BaseService):
                             if "=" in param:
                                 key, value = param.split("=", 1)
                                 post_data[key] = unquote(value)
-                
+
                 connection_data["data"]["post_data"] = post_data
                 self._handle_post_request(client_socket, path, headers, post_data, connection_data)
             else:
                 # Method not implemented
                 self._send_error(client_socket, 501, "Not Implemented")
-        
+
         except Exception as e:
             self.logger.error(f"Error handling HTTP client: {e}")
             connection_data["error"] = str(e)
@@ -397,12 +416,12 @@ class HTTPService(BaseService):
                 self._send_error(client_socket, 500, "Internal Server Error")
             except:
                 pass
-    
-    def _handle_get_request(self, client_socket: socket.socket, path: str, 
+
+    def _handle_get_request(self, client_socket: socket.socket, path: str,
                            headers: Dict[str, str], connection_data: Dict[str, Any]) -> None:
         """
         Handle HTTP GET requests
-        
+
         Args:
             client_socket: Client socket object
             path: Request path
@@ -413,19 +432,19 @@ class HTTPService(BaseService):
         if path in self.service_config.get("vulnerable_pages", []):
             self._handle_vulnerable_page(client_socket, path, headers, connection_data)
             return
-        
+
         # Clean the path to prevent directory traversal
         path = self._clean_path(path)
-        
+
         # Check if path is a file
         file_path = os.path.join(self.webroot, path.lstrip("/"))
-        
+
         # If path ends with /, append index.html
         if path.endswith("/"):
             file_path = os.path.join(file_path, "index.html")
             if not os.path.exists(file_path):
                 file_path = os.path.join(file_path[:-1], "index.php")
-        
+
         # Check if file exists
         if os.path.isfile(file_path):
             self._serve_file(client_socket, file_path)
@@ -437,13 +456,13 @@ class HTTPService(BaseService):
             else:
                 # File not found
                 self._send_error(client_socket, 404, "Not Found")
-    
-    def _handle_post_request(self, client_socket: socket.socket, path: str, 
+
+    def _handle_post_request(self, client_socket: socket.socket, path: str,
                             headers: Dict[str, str], post_data: Dict[str, str],
                             connection_data: Dict[str, Any]) -> None:
         """
         Handle HTTP POST requests
-        
+
         Args:
             client_socket: Client socket object
             path: Request path
@@ -455,7 +474,7 @@ class HTTPService(BaseService):
         if path == "/login.php" or path == "/admin/index.php":
             username = post_data.get("username", "")
             password = post_data.get("password", "")
-            
+
             # Log the login attempt
             login_attempt = {
                 "username": username,
@@ -463,25 +482,25 @@ class HTTPService(BaseService):
                 "path": path,
                 "timestamp": datetime.datetime.now().isoformat()
             }
-            
+
             if "login_attempts" not in connection_data["data"]:
                 connection_data["data"]["login_attempts"] = []
-                
+
             connection_data["data"]["login_attempts"].append(login_attempt)
-            
+
             self.logger.info(f"Login attempt from {connection_data['source_ip']} with username '{username}' and password '{password}'")
-            
+
             # Always return a login error page
             self._send_login_error(client_socket, path)
         else:
             # Default handler for other POST requests
             self._send_error(client_socket, 403, "Forbidden")
-    
-    def _handle_vulnerable_page(self, client_socket: socket.socket, path: str, 
+
+    def _handle_vulnerable_page(self, client_socket: socket.socket, path: str,
                                headers: Dict[str, str], connection_data: Dict[str, Any]) -> None:
         """
         Handle requests to vulnerable pages
-        
+
         Args:
             client_socket: Client socket object
             path: Request path
@@ -494,11 +513,11 @@ class HTTPService(BaseService):
         else:
             # Default to 404 for unknown vulnerable pages
             self._send_error(client_socket, 404, "Not Found")
-    
+
     def _serve_file(self, client_socket: socket.socket, file_path: str) -> None:
         """
         Serve a file over HTTP
-        
+
         Args:
             client_socket: Client socket object
             file_path: Path to the file to serve
@@ -507,11 +526,11 @@ class HTTPService(BaseService):
             # Get file extension for content type
             _, ext = os.path.splitext(file_path)
             content_type = self._get_content_type(ext)
-            
+
             # Read file content
             with open(file_path, "rb") as f:
                 content = f.read()
-            
+
             # Send response headers
             status_line = "HTTP/1.1 200 OK\r\n"
             headers = [
@@ -521,27 +540,70 @@ class HTTPService(BaseService):
                 f"Date: {datetime.datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT')}",
                 "Connection: close"
             ]
-            
+
             response = status_line + "\r\n".join(headers) + "\r\n\r\n"
             client_socket.send(response.encode())
-            
+
+            # Send file content
+            client_socket.send(content)
+
+        except Exception as e:
+            self.logger.error(f"Error serving file {file_path}: {e}")
+            self._send_error(client_socket, 500, "Internal Server Error")
+
+    def _send_error(self, client_socket: socket.socket, status_code: int, message: str) -> None:
+        """
+        Send an HTTP error response
+
+        Args:
+            client_socket: Client socket object
+            status_code: HTTP status code
+            message: Error message
+        """
+        try:
+            status_line = f"HTTP/1.1 {status_code} {message}\r\n"
+            content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{status_code} {message}</title>
+</head>
+<body>
+    <h1>{status_code} {message}</h1>
+    <p>The requested URL was not found on this server.</p>
+    <hr>
+    <p><em>{self.server_name}</em></p>
+</body>
+</html>
+"""
+            headers = [
+                f"Server: {self.server_name}",
+                "Content-Type: text/html; charset=utf-8",
+                f"Content-Length: {len(content)}",
+                f"Date: {datetime.datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT')}",
+                "Connection: close"
+            ]
+
+            response = status_line + "\r\n".join(headers) + "\r\n\r\n"
+            client_socket.send(response.encode())
+
             # Send content
             client_socket.send(content.encode())
-            
+
         except Exception as e:
             self.logger.error(f"Error sending HTTP error: {e}")
-    
+
     def _send_login_page(self, client_socket: socket.socket, path: str) -> None:
         """
         Send a fake login page
-        
+
         Args:
             client_socket: Client socket object
             path: Request path
         """
         try:
             status_line = "HTTP/1.1 200 OK\r\n"
-            
+
             # Create a login form based on the path
             title = "Login"
             if path == "/admin":
@@ -550,7 +612,7 @@ class HTTPService(BaseService):
                 title = "phpMyAdmin"
             elif path == "/wordpress/wp-admin":
                 title = "WordPress Admin"
-            
+
             content = f"""
 <!DOCTYPE html>
 <html>
@@ -620,7 +682,7 @@ class HTTPService(BaseService):
 </body>
 </html>
 """
-            
+
             headers = [
                 f"Server: {self.server_name}",
                 "Content-Type: text/html; charset=utf-8",
@@ -628,33 +690,33 @@ class HTTPService(BaseService):
                 f"Date: {datetime.datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT')}",
                 "Connection: close"
             ]
-            
+
             response = status_line + "\r\n".join(headers) + "\r\n\r\n"
             client_socket.send(response.encode())
-            
+
             # Send content
             client_socket.send(content.encode())
-            
+
         except Exception as e:
             self.logger.error(f"Error sending login page: {e}")
             self._send_error(client_socket, 500, "Internal Server Error")
-    
+
     def _send_login_error(self, client_socket: socket.socket, path: str) -> None:
         """
         Send a login error page
-        
+
         Args:
             client_socket: Client socket object
             path: Request path
         """
         try:
             status_line = "HTTP/1.1 200 OK\r\n"
-            
+
             # Create a login form with error message
             title = "Login"
             if path == "/admin/index.php":
                 title = "Admin Panel"
-            
+
             content = f"""
 <!DOCTYPE html>
 <html>
@@ -729,7 +791,7 @@ class HTTPService(BaseService):
 </body>
 </html>
 """
-            
+
             headers = [
                 f"Server: {self.server_name}",
                 "Content-Type: text/html; charset=utf-8",
@@ -737,39 +799,39 @@ class HTTPService(BaseService):
                 f"Date: {datetime.datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT')}",
                 "Connection: close"
             ]
-            
+
             response = status_line + "\r\n".join(headers) + "\r\n\r\n"
             client_socket.send(response.encode())
-            
+
             # Send content
             client_socket.send(content.encode())
-            
+
         except Exception as e:
             self.logger.error(f"Error sending login error page: {e}")
             self._send_error(client_socket, 500, "Internal Server Error")
-    
+
     def _clean_path(self, path: str) -> str:
         """
         Clean a path to prevent directory traversal
-        
+
         Args:
             path: Path to clean
-            
+
         Returns:
             Cleaned path
         """
         # Remove query string
         if "?" in path:
             path = path.split("?")[0]
-        
+
         # Remove fragments
         if "#" in path:
             path = path.split("#")[0]
-        
+
         # Remove multiple slashes
         while "//" in path:
             path = path.replace("//", "/")
-        
+
         # Remove directory traversal attempts
         parts = []
         for part in path.split("/"):
@@ -778,18 +840,18 @@ class HTTPService(BaseService):
                     parts.pop()
             elif part and part != ".":
                 parts.append(part)
-        
+
         # Rebuild path
         clean_path = "/" + "/".join(parts)
         return clean_path
-    
+
     def _get_content_type(self, extension: str) -> str:
         """
         Get MIME type for a file extension
-        
+
         Args:
             extension: File extension
-            
+
         Returns:
             MIME type string
         """
@@ -807,50 +869,26 @@ class HTTPService(BaseService):
             ".pdf": "application/pdf",
             ".xml": "application/xml",
             ".json": "application/json",
-            ".php": "text/html"  # PHP files are served as HTML
+            ".php": "text/html",  # PHP files are served as HTML
+            ".svg": "image/svg+xml",
+            ".csv": "text/csv",
+            ".doc": "application/msword",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xls": "application/vnd.ms-excel",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".zip": "application/zip",
+            ".tar": "application/x-tar",
+            ".gz": "application/gzip",
+            ".mp3": "audio/mpeg",
+            ".mp4": "video/mp4",
+            ".wav": "audio/wav",
+            ".ogg": "audio/ogg",
+            ".webp": "image/webp",
+            ".woff": "font/woff",
+            ".woff2": "font/woff2",
+            ".ttf": "font/ttf",
+            ".otf": "font/otf",
+            ".eot": "application/vnd.ms-fontobject"
         }
-        
-        return content_types.get(extension.lower(), "application/octet-stream") %d %b %Y %H:%M:%S GMT')}",
-                "Connection: close"
-            ]
-            
-            response = status_line + "\r\n".join(headers) + "\r\n\r\n"
-            client_socket.send(response.encode())
-            
-            # Send file content
-            client_socket.send(content)
-            
-        except Exception as e:
-            self.logger.error(f"Error serving file {file_path}: {e}")
-            self._send_error(client_socket, 500, "Internal Server Error")
-    
-    def _send_error(self, client_socket: socket.socket, status_code: int, message: str) -> None:
-        """
-        Send an HTTP error response
-        
-        Args:
-            client_socket: Client socket object
-            status_code: HTTP status code
-            message: Error message
-        """
-        try:
-            status_line = f"HTTP/1.1 {status_code} {message}\r\n"
-            content = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>{status_code} {message}</title>
-</head>
-<body>
-    <h1>{status_code} {message}</h1>
-    <p>The requested URL was not found on this server.</p>
-    <hr>
-    <p><em>{self.server_name}</em></p>
-</body>
-</html>
-"""
-            headers = [
-                f"Server: {self.server_name}",
-                "Content-Type: text/html; charset=utf-8",
-                f"Content-Length: {len(content)}",
-                f"Date: {datetime.datetime.now().strftime('%a,
+
+        return content_types.get(extension.lower(), "application/octet-stream")
