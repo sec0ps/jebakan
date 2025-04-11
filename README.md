@@ -1,4 +1,4 @@
-# Jebakan: Python Honeypot System
+# Jebakan: Python Honeypot System (Community Edition)
 
 Jebakan is a modular honeypot system written in Python for cybersecurity research, threat intelligence gathering, and network security monitoring.
 
