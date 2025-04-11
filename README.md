@@ -1,6 +1,6 @@
-# Jebakan -  A Python Honeypot System
+# Jebakan: Python Honeypot System
 
-Jebakan - A comprehensive, modular honeypot system written in Python for cybersecurity research, threat intelligence gathering, and network security monitoring.
+Jebakan is a modular honeypot system written in Python for cybersecurity research, threat intelligence gathering, and network security monitoring.
 
 ## Overview
 
@@ -47,8 +47,8 @@ This honeypot system creates convincing decoy services to attract and study atta
 
 1. Clone the repository:
    ```
-   git clone https://github.com/username/python-honeypot.git
-   cd python-honeypot
+   git clone https://github.com/username/jebakan.git
+   cd jebakan
    ```
 
 2. Install dependencies:
@@ -64,13 +64,13 @@ This honeypot system creates convincing decoy services to attract and study atta
 
 4. Run the honeypot:
    ```
-   python honeypot.py
+   python jebakan.py
    ```
 
 ### Command Line Options
 
 ```
-python honeypot.py [-h] [-c CONFIG] [-v] [-n] [--interaction {low,medium,high}] [--services SERVICES]
+python jebakan.py [-h] [-c CONFIG] [-v] [-n] [--interaction {low,medium,high}] [--services SERVICES]
 ```
 
 Options:
@@ -124,23 +124,26 @@ Access the dashboard at `http://localhost:8080` when enabled.
 ## Project Structure
 
 ```
-python-honeypot/
-├── honeypot.py          # Main application
-├── config/              # Configuration files
-├── data/                # Data files for services
-├── logs/                # Log output
-├── services/            # Service emulators
-│   ├── base_service.py  # Base service class
+jebakan/
+├── jebakan.py          # Main application
+├── config/             # Configuration files
+├── data/               # Data files for services
+├── logs/               # Log output
+├── services/           # Service emulators
+│   ├── base_service.py # Base service class
 │   ├── ssh_service.py
 │   ├── http_service.py
 │   └── ...
-└── utils/               # Utility modules
+└── utils/              # Utility modules
     ├── config_manager.py
     ├── analytics.py
     ├── dashboard.py
     └── alert_manager.py
 ```
 
+## Disclaimer
+
+This tool is for educational and research purposes only. Users are responsible for how they deploy and use this honeypot system. Always obtain proper authorization before deploying honeypots in production environments.
 ## License
 
 **Author**: Keith Pachulski  
