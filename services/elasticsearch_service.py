@@ -285,3 +285,52 @@ class ElasticsearchService(BaseService):
         })
 
         return self._generate_http_response(status_code, error_message, body)
+        
+    def _process_http_request(self, http_request: str) -> Tuple[str, Dict[str, Any]]:
+        """
+        Process HTTP request to Elasticsearch
+        
+        Args:
+            http_request: HTTP request string
+        
+        Returns:
+            Tuple of (response, query_info)
+        """
+        # Parse HTTP request
+        request_lines = http_request.split('\r\n')
+        request_line = request_lines[0] if request_lines else ""
+        
+        # Extract method, path and HTTP version
+        parts = request_line.split(' ')
+        if len(parts) >= 2:
+            method, path = parts[0], parts[1]
+        else:
+            return self._generate_error_response(400, "Bad Request"), {"error": "Invalid request format"}
+        
+        # Extract request body if present
+        body = ""
+        if "\r\n\r\n" in http_request:
+            body = http_request.split("\r\n\r\n", 1)[1]
+        
+        # Build query info for logging
+        query_info = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "method": method,
+            "path": path,
+            "body": body if body else None
+        }
+        
+        # Route request to appropriate handler
+        if path == "/":
+            return self._handle_root_request(), query_info
+        elif path == "/_cluster/health":
+            return self._handle_cluster_health(), query_info
+        elif path == "/_cat/indices":
+            return self._handle_cat_indices(), query_info
+        elif path.startswith("/_search"):
+            return self._handle_search_all(body), query_info
+        elif re.match(r'^/([^/]+)/_search$', path):
+            index = re.match(r'^/([^/]+)/_search$', path).group(1)
+            return self._handle_search(index, body), query_info
+        else:
+            return self._generate_error_response(404, f"Endpoint {path} not found"), query_info
