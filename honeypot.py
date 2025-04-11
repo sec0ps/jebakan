@@ -13,6 +13,7 @@ import time
 import argparse
 import signal
 import sys
+import re
 from typing import Dict, List, Any, Optional
 import colorama
 from colorama import Fore, Style, init
@@ -37,6 +38,14 @@ from utils.alert_manager import AlertManager
 running = True
 active_services = []
 logger = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)  # <-- ensures console output
+    ]
+)
 
 def setup_logging(config):
     """Set up logging based on configuration"""
@@ -137,94 +146,92 @@ def print_service_menu(config):
 def main():
     global logger, running
 
-    # Parse command line arguments
     parser = argparse.ArgumentParser(description="Python Honeypot System")
     parser.add_argument("-c", "--config", help="Path to configuration file", default="config/honeypot.json")
     parser.add_argument("-v", "--verbose", help="Increase output verbosity", action="store_true")
     parser.add_argument("-n", "--no-prompt", help="Start with default services (no interactive prompt)", action="store_true")
+    parser.add_argument("--interaction", choices=["low", "medium", "high"],
+                        help="Set global interaction level for all services")
     args = parser.parse_args()
 
-    # Print banner
     print_banner()
-
-    # Load configuration
     config = load_config(args.config)
 
-    # Override config settings from command line if specified
     if args.verbose:
         config["logging"]["level"] = "DEBUG"
         config["logging"]["console"] = True
 
-    # Set up logging
+    # Apply global interaction level if specified
+    if args.interaction:
+        for service in config.get("services", {}):
+            config["services"].setdefault(service, {})
+            config["services"][service]["interaction_level"] = args.interaction
+
+        default_ports = {
+            "ssh": 2222, "http": 8080, "ftp": 2121, "telnet": 2323,
+            "mysql": 3306, "mssql": 1433, "rdp": 3389, "vnc": 5900,
+            "redis": 6379, "elasticsearch": 9200, "docker": 2375
+        }
+        for svc, port in default_ports.items():
+            if svc not in config["services"]:
+                config["services"][svc] = {
+                    "enabled": False,
+                    "port": port,
+                    "interaction_level": args.interaction
+                }
+
+        config["global_interaction_level"] = args.interaction
+        save_config(config, args.config)
+
     logger = setup_logging(config)
     logger.info("Starting honeypot system...")
 
-    # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    services_to_enable = []
-    enable_dashboard = False
-    enable_analytics = False
-
     if args.no_prompt:
-        # Use default enabled services from config
-        for service_name, service_config in config["services"].items():
-            if service_config.get("enabled", False):
-                services_to_enable.append(service_name)
-
+        services_to_enable = [s for s, scfg in config["services"].items() if scfg.get("enabled")]
         enable_dashboard = config["dashboard"]["enabled"]
         enable_analytics = config["analytics"]["enabled"]
     else:
-        # Interactive prompt
-        result = select_services(config)
-        if result is None:
+        result = select_services(config, args)
+        if not result:
             print(f"{Fore.YELLOW}Exiting...")
             return
-
         services_to_enable, enable_dashboard, enable_analytics = result
+        print(f"[DEBUG] main(): Got services_to_enable: {services_to_enable}")
 
-    # Initialize alert manager
+        save_config(config, args.config)
+
     alert_manager = AlertManager(config)
+    analytics_engine = AnalyticsEngine(config) if enable_analytics else None
 
-    # Initialize analytics engine
-    analytics_engine = None
-    if enable_analytics:
-        analytics_engine = AnalyticsEngine(config)
-
-    # Start services
     started_services = start_services(config, services_to_enable)
 
-    # Start analytics engine if enabled
     if enable_analytics and analytics_engine:
         analytics_thread = threading.Thread(target=analytics_engine.start)
         analytics_thread.daemon = True
         analytics_thread.start()
         logger.info("Analytics engine started")
 
-    # Start dashboard server if enabled
-    dashboard_port = None
     if enable_dashboard:
         from utils.dashboard import DashboardServer
         dashboard_port = config["dashboard"]["port"]
-
-        # Check if dashboard port is available
-        if not check_port_available(config["network"]["bind_ip"], dashboard_port):
-            print(f"{Fore.RED}Dashboard port {dashboard_port} is already in use. Dashboard will not be started.")
-            logger.error(f"Dashboard port {dashboard_port} is already in use.")
-        else:
+        if check_port_available(config["network"]["bind_ip"], dashboard_port):
             dashboard = DashboardServer(config, analytics_engine)
             dashboard_thread = threading.Thread(target=dashboard.start)
             dashboard_thread.daemon = True
             dashboard_thread.start()
             logger.info(f"Dashboard server started on port {dashboard_port}")
+        else:
+            print(f"{Fore.RED}Dashboard port {dashboard_port} is already in use. Dashboard will not be started.")
+            logger.error(f"Dashboard port {dashboard_port} is already in use.")
+    else:
+        dashboard_port = None
 
-    # Print status
-    print_status(started_services, dashboard_port if enable_dashboard else None, enable_analytics)
-
+    print_status(started_services, dashboard_port, enable_analytics)
     logger.info(f"Honeypot started with {len(started_services)} service(s)")
 
-    # Keep the main thread alive
     try:
         while running:
             time.sleep(1)
@@ -232,98 +239,76 @@ def main():
         running = False
         logger.info("Shutting down honeypot...")
 
-def select_services(config):
+def select_services(config, args):
     """Prompt user to select services to enable"""
+    from utils.config_manager import save_config
+
+    if "global_interaction_level" not in config:
+        config["global_interaction_level"] = args.interaction or "high"
+
     print_service_menu(config)
+
+    service_map = [
+        "ssh", "http", "ftp", "telnet", "mysql", "mssql",
+        "rdp", "vnc", "redis", "elasticsearch", "docker"
+    ]
+    default_ports = {
+        "ssh": 2222, "http": 8080, "ftp": 2121, "telnet": 2323,
+        "mysql": 3306, "mssql": 1433, "rdp": 3389, "vnc": 5900,
+        "redis": 6379, "elasticsearch": 9200, "docker": 2375
+    }
 
     while True:
         try:
-            choice = input(f"\n{Fore.GREEN}Enter your selection: {Style.RESET_ALL}").strip().lower()
+            raw = input(f"\n{Fore.GREEN}Enter your selection: {Style.RESET_ALL}")
+            cleaned = raw.strip().lower()
+            print(f"[DEBUG] Raw input: {repr(raw)}")
 
-            if choice == 'q':
+            if cleaned == 'q':
                 return None, False, False
 
+            enable_dashboard = 'd' in cleaned
+            enable_analytics = 'a' in cleaned
+
+            # Do NOT remove 'a' or 'd' until AFTER checking 'all'
+            if cleaned == 'all':
+                cleaned = ','.join(str(i) for i in range(1, len(service_map) + 1))
+                print(f"[DEBUG] Interpreting 'all' as: {cleaned}")
+
+            # Now safely strip dashboard/analytics flags
+            cleaned = cleaned.replace('d', '').replace('a', '').replace(' ', '')
+
+            selected_services = []
+            for part in cleaned.split(','):
+                if part.isdigit():
+                    idx = int(part) - 1
+                    if 0 <= idx < len(service_map):
+                        selected_services.append(service_map[idx])
+                elif part in service_map:
+                    selected_services.append(part)
+
+            print(f"[DEBUG] Selected services: {selected_services}")
+
             services_to_enable = []
-            enable_dashboard = False
-            enable_analytics = False
+            for svc in selected_services:
+                config["services"].setdefault(svc, {
+                    "port": default_ports[svc],
+                    "enabled": True,
+                    "interaction_level": config["global_interaction_level"]
+                })
+                config["services"][svc]["enabled"] = True
+                config["services"][svc].setdefault("interaction_level", config["global_interaction_level"])
 
-            if 'd' in choice:
-                enable_dashboard = True
-                choice = choice.replace('d', '')
+                services_to_enable.append(svc)
 
-            if 'a' in choice:
-                enable_analytics = True
-                choice = choice.replace('a', '')
-
-            # Clean up the input
-            choice = choice.replace(' ', '')
-
-            # Available services
-            service_map = ["ssh", "http", "ftp", "telnet", "mysql", "mssql", "rdp", "vnc", "redis", "elasticsearch", "docker"]
-
-            if choice == 'all':
-                services_to_enable = service_map
-            else:
-                # Handle comma-separated list and digit selection
-                parts = choice.split(',')
-                for part in parts:
-                    if part.isdigit():
-                        idx = int(part) - 1
-                        if 0 <= idx < len(service_map):
-                            services_to_enable.append(service_map[idx])
-                    elif part in service_map:
-                        services_to_enable.append(part)
-
-            # Validate port availability and ensure services exist in config
-            for service in services_to_enable[:]:  # Copy list to safely modify during iteration
-                # Add service to config if it doesn't exist
-                if service not in config["services"]:
-                    print(f"{Fore.YELLOW}Adding {service.upper()} service to configuration...")
-                    # Set default configuration based on service type
-                    if service == "mysql":
-                        config["services"][service] = {
-                            "enabled": True,
-                            "port": 3306,
-                            "server_version": "5.7.34-log",
-                            "auth_attempts": 3,
-                            "credentials": [
-                                {"username": "root", "password": ""},
-                                {"username": "root", "password": "password"},
-                                {"username": "admin", "password": "admin123"}
-                            ],
-                            "interaction_level": "medium"
-                        }
-                    elif service == "mssql":
-                        config["services"][service] = {
-                            "enabled": True,
-                            "port": 1433,
-                            "server_version": "Microsoft SQL Server 2019",
-                            "server_name": "SQLSERVER",
-                            "instance_name": "MSSQLSERVER",
-                            "auth_attempts": 3,
-                            "credentials": [
-                                {"username": "sa", "password": "sa"},
-                                {"username": "sa", "password": "password"},
-                                {"username": "admin", "password": "admin123"}
-                            ],
-                            "interaction_level": "medium"
-                        }
-
-                # Check port availability
-                port = config["services"][service]["port"]
-                if not check_port_available(config["network"]["bind_ip"], port):
-                    print(f"{Fore.RED}Warning: {service.upper()} port {port} is already in use.")
-                    confirm = input(f"{Fore.YELLOW}Do you want to continue without {service.upper()}? (y/n): {Style.RESET_ALL}").lower()
-                    if confirm == 'y':
-                        services_to_enable.remove(service)
-                    else:
-                        print(f"{Fore.CYAN}Please select services again.")
-                        return select_services(config)
-
-            if services_to_enable or enable_dashboard or enable_analytics:
-                return services_to_enable, enable_dashboard, enable_analytics
-            else:
+            if not services_to_enable and not enable_dashboard and not enable_analytics:
                 print(f"{Fore.RED}No valid services selected. Please try again.")
+                continue
+
+            save_config(config, args.config)
+            logger.info(f"Saved configuration to {args.config}")
+            return services_to_enable, enable_dashboard, enable_analytics
+
         except Exception as e:
             print(f"{Fore.RED}Error: {e}. Please try again.")
 
@@ -686,11 +671,25 @@ def print_status(started_services, dashboard_port=None, analytics_enabled=False)
 def main():
     global logger, running
 
+    # Define the valid services from service_map
+    service_map = [
+        "ssh", "http", "ftp", "telnet", "mysql", "mssql",
+        "rdp", "vnc", "redis", "elasticsearch", "docker"
+    ]
+    service_choices = ', '.join(service_map)
+
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Python Honeypot System")
     parser.add_argument("-c", "--config", help="Path to configuration file", default="config/honeypot.json")
     parser.add_argument("-v", "--verbose", help="Increase output verbosity", action="store_true")
     parser.add_argument("-n", "--no-prompt", help="Start with default services (no interactive prompt)", action="store_true")
+    parser.add_argument("--interaction", choices=["low", "medium", "high"],
+                        help="Set global interaction level for all services")
+    parser.add_argument(
+        "--services",
+        help=f"Comma-separated list of services to enable or 'all'. Options: {service_choices}",
+        type=str
+    )
     args = parser.parse_args()
 
     # Print banner
@@ -699,10 +698,16 @@ def main():
     # Load configuration
     config = load_config(args.config)
 
-    # Override config settings from command line if specified
+    # Override logging settings if specified
     if args.verbose:
         config["logging"]["level"] = "DEBUG"
         config["logging"]["console"] = True
+
+    # If interaction level was provided, apply it globally
+    if args.interaction:
+        config["global_interaction_level"] = args.interaction
+        for svc in config.get("services", {}).values():
+            svc["interaction_level"] = args.interaction
 
     # Set up logging
     logger = setup_logging(config)
@@ -716,17 +721,23 @@ def main():
     enable_dashboard = False
     enable_analytics = False
 
-    if args.no_prompt:
-        # Use default enabled services from config
-        for service_name, service_config in config["services"].items():
-            if service_config.get("enabled", False):
-                services_to_enable.append(service_name)
+    if args.no_prompt or args.services:
+        if args.services:
+            cleaned = args.services.strip().lower()
+            if cleaned == "all":
+                services_to_enable = service_map
+            else:
+                parts = [p.strip() for p in cleaned.split(',')]
+                services_to_enable = [s for s in parts if s in service_map]
+        else:
+            for s, scfg in config["services"].items():
+                if scfg.get("enabled", False):
+                    services_to_enable.append(s)
 
         enable_dashboard = config["dashboard"]["enabled"]
         enable_analytics = config["analytics"]["enabled"]
     else:
-        # Interactive prompt
-        result = select_services(config)
+        result = select_services(config, args)
         if not result:
             print(f"{Fore.YELLOW}Exiting...")
             return
@@ -744,6 +755,11 @@ def main():
     # Start services
     started_services = start_services(config, services_to_enable)
 
+    # Save updated interaction level if set via CLI
+    if args.interaction:
+        save_config(config, args.config)
+        logger.info(f"Saved global interaction level '{args.interaction}' to {args.config}")
+
     # Start analytics engine if enabled
     if enable_analytics and analytics_engine:
         analytics_thread = threading.Thread(target=analytics_engine.start)
@@ -757,7 +773,6 @@ def main():
         from utils.dashboard import DashboardServer
         dashboard_port = config["dashboard"]["port"]
 
-        # Check if dashboard port is available
         if not check_port_available(config["network"]["bind_ip"], dashboard_port):
             print(f"{Fore.RED}Dashboard port {dashboard_port} is already in use. Dashboard will not be started.")
             logger.error(f"Dashboard port {dashboard_port} is already in use.")
@@ -770,7 +785,6 @@ def main():
 
     # Print status
     print_status(started_services, dashboard_port if enable_dashboard else None, enable_analytics)
-
     logger.info(f"Honeypot started with {len(started_services)} service(s)")
 
     # Keep the main thread alive
