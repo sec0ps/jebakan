@@ -310,7 +310,7 @@ class DockerService(BaseService):
             "Images": len(self.images),
             "Driver": "overlay2",
             "DriverStatus": [
-                ["Backing Filesystem", "extfs"],
+                ["Backing Filesystem", "ext"],
                 ["Supports d_type", "true"],
                 ["Native Overlay Diff", "true"]
             ],
@@ -482,4 +482,4 @@ class DockerService(BaseService):
             "message": error_message
         })
 
-        return self._generate_http_response(status_code, error_message, body)fs
+        return self._generate_http_response(status_code, error_message, body)
