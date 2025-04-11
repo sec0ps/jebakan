@@ -12,9 +12,18 @@ import os
 import time
 import re
 import paramiko
+import sys
 from typing import Dict, List, Any, Tuple, Optional
 
 from services.base_service import BaseService
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)  # <-- ensures console output
+    ]
+)
 
 class SSHService(BaseService):
     """SSH service emulator for the honeypot"""
@@ -92,84 +101,110 @@ class SSHService(BaseService):
             if self.sock:
                 self.sock.close()
 
-    def handle_client(self, client_socket: socket.socket, address: Tuple[str, int], 
-                     connection_data: Dict[str, Any]) -> None:
-        """
-        Handle a client connection to the SSH service
-        
-        Args:
-            client_socket: Client socket object
-            address: Client address tuple (ip, port)
-            connection_data: Dictionary to store connection data for logging
-        """
+    def handle_client(self, client_socket: socket.socket, address: Tuple[str, int],
+                    connection_data: Dict[str, Any]) -> None:
         session_id = f"{address[0]}:{address[1]}:{time.time()}"
-        
-        # Initialize command history for this session
         self.command_history[session_id] = []
-        
-        # Wrap the client socket with Paramiko's Transport correctly
+
         transport = paramiko.Transport(client_socket)
         transport.add_server_key(paramiko.RSAKey(filename=self.key_file))
-
         server_interface = CustomSSHServerInterface(self)
 
         try:
+            self.logger.info(f"[{address}] Starting SSH session")
             transport.start_server(server=server_interface)
 
-            chan = transport.accept(20)
+            chan = transport.accept(10)
             if chan is None:
-                self.logger.error(f"No channel for {address}")
+                self.logger.error(f"[{address}] No channel opened")
                 return
 
-            # Send welcome message and prompt
+            self.logger.info(f"[{address}] Channel accepted")
+
+            if not server_interface.event.wait(5):
+                self.logger.error(f"[{address}] Shell not requested in time")
+                chan.close()
+                return
+
+            if not chan.send_ready():
+                self.logger.warning(f"[{address}] Channel not ready for send()")
+                chan.close()
+                return
+
+            chan.settimeout(15.0)
             hostname = self.config["deception"]["system_info"]["hostname"]
-            username = server_interface.username
+            username = server_interface.username or "user"
+
+            chan.send(b"DEBUG: shell started\r\n")
             chan.send(f"Welcome to Ubuntu 18.04.5 LTS ({hostname})\r\n".encode())
             chan.send(f"{username}@{hostname}:~$ ".encode())
 
-            # Interactive command loop
+            buffer = ''
+
             while True:
-                command = ''
-                while not command.endswith('\n'):
+                try:
                     data = chan.recv(1024)
                     if not data:
+                        self.logger.info(f"[{address}] Channel closed")
                         break
-                    command += data.decode('utf-8')
 
-                command = command.strip()
-                if not command or command.lower() in ['exit', 'logout', 'quit']:
-                    chan.send("logout\r\n".encode())
+                    decoded = data.decode('utf-8', errors='ignore')
+                    self.logger.info(f"[{address}] RAW input: {repr(decoded)}")
+                    buffer += decoded
+                    chan.send(decoded.encode())  # echo each character back as typed
+
+                    if '\n' in buffer or '\r' in buffer:
+                        command = buffer.strip().replace('\r', '').replace('\n', '')
+                        buffer = ''
+
+                        if not command:
+                            chan.send(f"{username}@{hostname}:~$ ".encode())
+                            continue
+
+                        self.logger.info(f"[{address}] Command received: {command}")
+                        self.command_history[session_id].append({
+                            "command": command,
+                            "timestamp": datetime.datetime.now().isoformat()
+                        })
+
+                        if command.lower() in ['exit', 'logout', 'quit']:
+                            chan.send(b"logout\r\n")
+                            break
+
+                        chan.send((command + '\r\n').encode())
+                        response = self.simulate_command_response(command)
+                        if not response.endswith('\n'):
+                            response += '\r\n'
+                        chan.send(response.encode())
+                        chan.send(f"{username}@{hostname}:~$ ".encode())
+
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    self.logger.error(f"[{address}] Error: {e}")
                     break
 
-                # Log the command
-                self.command_history[session_id].append({
-                    "command": command,
-                    "timestamp": datetime.datetime.now().isoformat()
-                })
-
-                response = self.simulate_command_response(command)
-                chan.send(response.encode())
-                chan.send(f"{username}@{hostname}:~$ ".encode())
-
         except Exception as e:
-            self.logger.error(f"Error handling SSH client: {e}")
+            self.logger.error(f"[{address}] SSH session error: {e}")
             connection_data["error"] = str(e)
         finally:
-            transport.close()
-            client_socket.close()
+            try:
+                chan.close()
+                transport.close()
+                client_socket.close()
+            except Exception:
+                pass
             connection_data["data"]["command_history"] = self.command_history.pop(session_id, [])
 
     def simulate_command_response(self, command: str, context: Dict[str, Any] = None) -> str:
         """
         Simulate a response to an SSH command
-        
-        (Original function preserved exactly as provided—no changes)
         """
         interaction_level = self.service_config.get("interaction_level", "medium")
+        hostname = self.config["deception"]["system_info"]["hostname"]
 
-        # Handle common system commands
         if command.startswith("cd "):
-            return ""  # Just acknowledge cd commands silently
+            return ""
 
         elif command == "pwd":
             return "/home/user\r\n"
@@ -181,13 +216,12 @@ class SSHService(BaseService):
             return "uid=1000(user) gid=1000(user) groups=1000(user)\r\n"
 
         elif command == "uname -a":
-            return f"Linux {self.config['deception']['system_info']['hostname']} {self.config['deception']['system_info']['kernel']} GNU/Linux\r\n"
+            return f"Linux {hostname} {self.config['deception']['system_info']['kernel']} GNU/Linux\r\n"
 
         elif command == "hostname":
-            return f"{self.config['deception']['system_info']['hostname']}\r\n"
+            return f"{hostname}\r\n"
 
         elif command.startswith("ls"):
-            # Simulate different directories
             if " /etc" in command:
                 return "apache2  cron.d  hosts  motd  passwd  shadow  ssh\r\n"
             elif " /var" in command:
@@ -198,36 +232,49 @@ class SSHService(BaseService):
         elif command == "cat secret.txt":
             if interaction_level == "high":
                 if self.config["deception"]["breadcrumbs"]:
-                    return "Database credentials:\nUser: dbadmin\nPassword: Str0ngP@$w0rd\nServer: 192.168.1.10\r\n"
+                    return (
+                        "Database credentials:\r\n"
+                        "User: dbadmin\r\n"
+                        "Password: Str0ngP@$w0rd\r\n"
+                        "Server: 192.168.1.10\r\n"
+                    )
                 else:
                     return "Permission denied\r\n"
             else:
                 return "Permission denied\r\n"
 
         elif command.startswith("ps"):
-            return " PID TTY          TIME CMD\n 1234 pts/0    00:00:00 bash\n 5678 pts/0    00:00:00 ps\n"
+            return (
+                " PID TTY          TIME CMD\r\n"
+                " 1234 pts/0    00:00:00 bash\r\n"
+                " 5678 pts/0    00:00:00 ps\r\n"
+            )
 
         elif command.startswith("netstat") or command.startswith("ss"):
-            return ("tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN\n"
-                    "tcp        0      0 0.0.0.0:80              0.0.0.0:*               LISTEN\n"
-                    "tcp        0      0 127.0.0.1:3306          0.0.0.0:*               LISTEN\n")
+            return (
+                "tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN\r\n"
+                "tcp        0      0 0.0.0.0:80              0.0.0.0:*               LISTEN\r\n"
+                "tcp        0      0 127.0.0.1:3306          0.0.0.0:*               LISTEN\r\n"
+            )
 
         elif command.startswith("ifconfig") or command.startswith("ip a"):
-            return ("eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\n"
-                    "        inet 192.168.1.100  netmask 255.255.255.0  broadcast 192.168.1.255\n")
+            return (
+                "eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\r\n"
+                "        inet 192.168.1.100  netmask 255.255.255.0  broadcast 192.168.1.255\r\n"
+            )
 
         elif command.startswith("wget") or command.startswith("curl"):
             if any(x in command for x in [".sh", ".pl", ".py", ".bin", ".elf", ".malware"]):
                 self.logger.warning(f"Possible malware download attempt: {command}")
-            return "Connecting...\nHTTP request sent, awaiting response... 404 Not Found\r\n"
+            return "Connecting...\r\nHTTP request sent, awaiting response... 404 Not Found\r\n"
 
         elif "passwd" in command:
-            return "Changing password for user.\nCurrent password: \r\n"
+            return "Changing password for user.\r\nCurrent password: \r\n"
 
         elif command.startswith("sudo"):
             return "[sudo] password for user: Sorry, try again.\r\n"
 
-        return super().simulate_command_response(command, context)
+        return f"Command not found: {command}\r\n"
 
 class CustomSSHServerInterface(paramiko.ServerInterface):
     def __init__(self, service: SSHService):
@@ -237,17 +284,16 @@ class CustomSSHServerInterface(paramiko.ServerInterface):
 
     def check_auth_password(self, username, password):
         self.username = username
-        if self.service.is_valid_credentials(username, password):
-            return paramiko.AUTH_SUCCESSFUL
-        return paramiko.AUTH_FAILED
+        return paramiko.AUTH_SUCCESSFUL if self.service.is_valid_credentials(username, password) else paramiko.AUTH_FAILED
 
     def get_allowed_auths(self, username):
         return 'password'
 
     def check_channel_request(self, kind, chanid):
-        if kind == 'session':
-            return paramiko.OPEN_SUCCEEDED
-        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+        return paramiko.OPEN_SUCCEEDED if kind == 'session' else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+    def check_channel_pty_request(self, channel, term, width, height, pixelwidth, pixelheight, modes):
+        return True
 
     def check_channel_shell_request(self, channel):
         self.event.set()
