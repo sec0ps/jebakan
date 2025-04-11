@@ -89,20 +89,12 @@ hostname = web-prod-01
 environment = production
 """)
     
-    def handle_client(self, client_socket: socket.socket, address: Tuple[str, int], 
-                     connection_data: Dict[str, Any]) -> None:
+    def handle_client(self, client_socket: socket.socket, address: Tuple[str, int],
+                    connection_data: Dict[str, Any]) -> None:
         """
         Handle a client connection to the FTP service
-        
-        Args:
-            client_socket: Client socket object
-            address: Client address tuple (ip, port)
-            connection_data: Dictionary to store connection data for logging
         """
-        # Create a unique session ID for this connection
         session_id = f"{address[0]}:{address[1]}:{time.time()}"
-        
-        # Initialize session state
         self.sessions[session_id] = {
             "authenticated": False,
             "username": None,
@@ -111,235 +103,153 @@ environment = production
             "passive_mode": False,
             "data_port": None,
             "data_ip": None,
-            "commands": []
+            "commands": [],
+            "data_sock": None  # explicitly track the passive socket
         }
-        
-        # Send welcome banner
+
         self._send_response(client_socket, self.banner)
-        
+
         try:
-            authenticated = False
-            quit_command_received = False
-            
-            while not quit_command_received:
-                # Receive command
+            while True:
                 cmd_line = client_socket.recv(1024).decode('utf-8', errors='ignore').strip()
                 if not cmd_line:
                     break
-                
-                # Parse command and arguments
+
                 if " " in cmd_line:
                     cmd, arg = cmd_line.split(" ", 1)
                 else:
                     cmd, arg = cmd_line, ""
-                
+
                 cmd = cmd.upper()
-                
-                # Log the command
-                cmd_info = {
-                    "command": cmd,
-                    "argument": arg,
-                    "timestamp": datetime.datetime.now().isoformat()
-                }
-                self.sessions[session_id]["commands"].append(cmd_info)
-                
-                # Add command to connection data
-                if "commands" not in connection_data["data"]:
-                    connection_data["data"]["commands"] = []
-                connection_data["data"]["commands"].append(cmd_info)
-                
-                self.logger.debug(f"FTP command from {address[0]}: {cmd} {arg}")
-                
-                # Process commands
+
+                session = self.sessions[session_id]
+                current_dir = session["current_dir"]
+
                 if cmd == "USER":
-                    # Store the username for later authentication
-                    self.sessions[session_id]["username"] = arg
+                    session["username"] = arg
                     self._send_response(client_socket, "331 User name okay, need password.")
-                
                 elif cmd == "PASS":
-                    # Check if username was provided
-                    username = self.sessions[session_id]["username"]
-                    if not username:
-                        self._send_response(client_socket, "503 Login with USER first.")
-                        continue
-                    
-                    # Log the authentication attempt
-                    auth_data = {
-                        "username": username,
-                        "password": arg,
-                        "timestamp": datetime.datetime.now().isoformat()
-                    }
-                    
-                    if "auth_attempts" not in connection_data["data"]:
-                        connection_data["data"]["auth_attempts"] = []
-                        
-                    connection_data["data"]["auth_attempts"].append(auth_data)
-                    
-                    # Check credentials
+                    username = session["username"]
                     if self.is_valid_credentials(username, arg):
-                        # Authentication successful
-                        self.sessions[session_id]["authenticated"] = True
-                        authenticated = True
-                        connection_data["data"]["auth_result"] = "success"
+                        session["authenticated"] = True
                         self._send_response(client_socket, "230 User logged in, proceed.")
-                        self.logger.info(f"Successful FTP authentication from {address[0]} with username '{username}' and password '{arg}'")
                     else:
-                        # Authentication failed
-                        connection_data["data"]["auth_result"] = "failure"
                         self._send_response(client_socket, "530 Login incorrect.")
-                        self.logger.info(f"Failed FTP authentication from {address[0]} with username '{username}' and password '{arg}'")
-                
-                elif cmd == "QUIT":
-                    self._send_response(client_socket, "221 Goodbye.")
-                    quit_command_received = True
-                
-                elif not authenticated:
-                    # Require authentication for all other commands
+                elif not session["authenticated"]:
                     self._send_response(client_socket, "530 Not logged in.")
-                
                 elif cmd == "PWD":
-                    # Print working directory
-                    current_dir = self.sessions[session_id]["current_dir"]
                     self._send_response(client_socket, f'257 "{current_dir}" is the current directory.')
-                
                 elif cmd == "CWD":
-                    # Change working directory
-                    new_dir = self._clean_path(arg, self.sessions[session_id]["current_dir"])
-                    self.sessions[session_id]["current_dir"] = new_dir
+                    new_dir = self._clean_path(arg, current_dir)
+                    session["current_dir"] = new_dir
                     self._send_response(client_socket, f'250 Directory changed to {new_dir}')
-                
-                elif cmd == "CDUP":
-                    # Change to parent directory
-                    current_dir = self.sessions[session_id]["current_dir"]
-                    if current_dir == "/":
-                        new_dir = "/"
-                    else:
-                        new_dir = "/".join(current_dir.split("/")[:-1])
-                        if not new_dir:
-                            new_dir = "/"
-                    
-                    self.sessions[session_id]["current_dir"] = new_dir
-                    self._send_response(client_socket, f'250 Directory changed to {new_dir}')
-                
                 elif cmd == "TYPE":
-                    # Set transfer type
-                    if arg == "A":
-                        self.sessions[session_id]["binary_mode"] = False
-                        self._send_response(client_socket, "200 Type set to A.")
-                    elif arg == "I":
-                        self.sessions[session_id]["binary_mode"] = True
+                    if arg.upper() == "I":
+                        session["binary_mode"] = True
                         self._send_response(client_socket, "200 Type set to I.")
                     else:
-                        self._send_response(client_socket, "504 Command not implemented for that parameter.")
-                
+                        session["binary_mode"] = False
+                        self._send_response(client_socket, "200 Type set to A.")
                 elif cmd == "PASV":
-                    # Enter passive mode
-                    self.sessions[session_id]["passive_mode"] = True
-                    
-                    # Bind to a random port for data connection
-                    data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    data_sock.bind((self.host, 0))
-                    data_sock.listen(1)
-                    
-                    # Get the port number
-                    _, data_port = data_sock.getsockname()
-                    self.sessions[session_id]["data_port"] = data_port
-                    
-                    # Convert IP and port to FTP passive mode format
-                    ip_parts = self.host.split(".")
-                    port_high = data_port // 256
-                    port_low = data_port % 256
-                    
-                    pasv_response = f"227 Entering Passive Mode ({','.join(ip_parts)},{port_high},{port_low})."
-                    self._send_response(client_socket, pasv_response)
-                    
-                    # Wait for data connection in a separate thread
-                    data_thread = threading.Thread(
-                        target=self._handle_passive_connection,
-                        args=(data_sock, session_id)
-                    )
-                    data_thread.daemon = True
-                    data_thread.start()
-                
-                elif cmd == "PORT":
-                    # Enter active mode
-                    self.sessions[session_id]["passive_mode"] = False
-                    
-                    # Parse the PORT command argument
-                    parts = arg.split(",")
-                    if len(parts) != 6:
-                        self._send_response(client_socket, "501 Syntax error in parameters.")
-                        continue
-                    
-                    # Extract IP and port
-                    ip = ".".join(parts[:4])
-                    port = (int(parts[4]) * 256) + int(parts[5])
-                    
-                    self.sessions[session_id]["data_ip"] = ip
-                    self.sessions[session_id]["data_port"] = port
-                    
-                    self._send_response(client_socket, "200 PORT command successful.")
-                
-                elif cmd == "LIST":
-                    # List directory contents
-                    self._send_response(client_socket, "150 Opening ASCII mode data connection for file list.")
-                    
-                    # Simulate directory listing
-                    current_dir = self.sessions[session_id]["current_dir"]
-                    listing = self._get_directory_listing(current_dir)
-                    
-                    # Send listing via data connection
-                    if self.sessions[session_id]["passive_mode"]:
-                        # Data connection is handled by _handle_passive_connection
-                        if "data_sock" in self.sessions[session_id]:
-                            data_sock = self.sessions[session_id]["data_sock"]
-                            data_sock.send(listing.encode())
-                            data_sock.close()
-                            del self.sessions[session_id]["data_sock"]
-                            self._send_response(client_socket, "226 Transfer complete.")
-                        else:
-                            self._send_response(client_socket, "425 Can't open data connection.")
-                    else:
-                        # Active mode - connect to client
+                    # Open passive socket
+                    psock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    psock.bind((self.host, 0))
+                    psock.listen(1)
+                    _, data_port = psock.getsockname()
+
+                    # Fix passive IP response
+                    real_host = self.config.get("public_ip", self.host)
+                    if real_host == "0.0.0.0":
+                        real_host = "127.0.0.1"
+
+                    ip_parts = real_host.split(".")
+                    p1, p2 = data_port // 256, data_port % 256
+                    self._send_response(client_socket, f"227 Entering Passive Mode ({','.join(ip_parts)},{p1},{p2}).")
+
+                    # Accept data connection in background
+                    def wait_for_data_conn():
                         try:
-                            data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            data_sock.connect((self.sessions[session_id]["data_ip"], self.sessions[session_id]["data_port"]))
-                            data_sock.send(listing.encode())
-                            data_sock.close()
-                            self._send_response(client_socket, "226 Transfer complete.")
+                            psock.settimeout(10)
+                            dsock, _ = psock.accept()
+                            session["data_sock"] = dsock
                         except Exception as e:
-                            self.logger.error(f"Error sending data in active mode: {e}")
-                            self._send_response(client_socket, "425 Can't open data connection.")
-                
+                            self.logger.warning(f"Passive mode connection failed: {e}")
+                        finally:
+                            psock.close()
+
+                    threading.Thread(target=wait_for_data_conn, daemon=True).start()
+
+                elif cmd == "LIST":
+                    self._send_response(client_socket, "150 Here comes the directory listing.")
+                    time.sleep(1)
+                    if session["data_sock"]:
+                        listing = self._get_directory_listing(current_dir)
+                        try:
+                            session["data_sock"].sendall(listing.encode())
+                            session["data_sock"].close()
+                            session["data_sock"] = None
+                            self._send_response(client_socket, "226 Directory send OK.")
+                        except Exception as e:
+                            self.logger.error(f"LIST failed: {e}")
+                            self._send_response(client_socket, "426 Data connection error.")
+                    else:
+                        self._send_response(client_socket, "425 Can't open data connection.")
+
                 elif cmd == "RETR":
-                    # Retrieve a file
-                    filename = arg
-                    self._send_response(client_socket, f"550 File not found: {filename}")
-                
+                    file_path = os.path.join(self.ftproot, current_dir.strip("/"), arg)
+                    if os.path.isfile(file_path) and session["data_sock"]:
+                        self._send_response(client_socket, f"150 Opening binary mode data connection for {arg}")
+                        try:
+                            with open(file_path, "rb") as f:
+                                data = f.read()
+                            session["data_sock"].sendall(data)
+                            session["data_sock"].close()
+                            session["data_sock"] = None
+                            self._send_response(client_socket, "226 Transfer complete.")
+                            self.logger.info(f"File {arg} sent to {session['username']} at {address[0]}")
+                        except Exception as e:
+                            self.logger.error(f"Error sending file: {e}")
+                            self._send_response(client_socket, "451 Requested action aborted. Local error.")
+                    else:
+                        self._send_response(client_socket, "550 File not found or no data connection.")
+
                 elif cmd == "STOR":
-                    # Store a file
-                    filename = arg
-                    self._send_response(client_socket, f"553 Could not create file: {filename}")
-                
-                elif cmd == "SYST":
-                    # Return system type
-                    self._send_response(client_socket, "215 UNIX Type: L8")
-                
-                elif cmd == "NOOP":
-                    # No operation
-                    self._send_response(client_socket, "200 NOOP command successful.")
-                
+                    upload_path = os.path.join(self.ftproot, "upload", arg)
+                    if session["data_sock"]:
+                        self._send_response(client_socket, f"150 Ok to send data for {arg}")
+                        try:
+                            with open(upload_path, "wb") as f:
+                                while True:
+                                    chunk = session["data_sock"].recv(4096)
+                                    if not chunk:
+                                        break
+                                    f.write(chunk)
+                            session["data_sock"].close()
+                            session["data_sock"] = None
+                            self._send_response(client_socket, "226 Transfer complete.")
+                            self.logger.info(f"File {arg} uploaded from {address[0]}")
+                        except Exception as e:
+                            self.logger.error(f"Error saving file: {e}")
+                            self._send_response(client_socket, "451 Transfer aborted due to error.")
+                    else:
+                        self._send_response(client_socket, "425 Can't open data connection.")
+
+                elif cmd == "QUIT":
+                    self._send_response(client_socket, "221 Goodbye.")
+                    break
                 else:
-                    # Command not implemented
                     self._send_response(client_socket, "502 Command not implemented.")
-        
         except Exception as e:
-            self.logger.error(f"Error handling FTP client: {e}")
-            connection_data["error"] = str(e)
+            self.logger.error(f"FTP session error: {e}")
         finally:
-            # Clean up session data
             if session_id in self.sessions:
+                if self.sessions[session_id].get("data_sock"):
+                    try:
+                        self.sessions[session_id]["data_sock"].close()
+                    except:
+                        pass
                 del self.sessions[session_id]
+
     
     def _send_response(self, client_socket: socket.socket, response: str) -> None:
         """
