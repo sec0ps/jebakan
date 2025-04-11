@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Elasticsearch service emulator for the honeypot system
+SSH service emulator for the honeypot system
 """
 
 import socket
@@ -11,326 +11,298 @@ import json
 import os
 import time
 import re
+import paramiko
+import sys
 from typing import Dict, List, Any, Tuple, Optional
 
 from services.base_service import BaseService
 
-class ElasticsearchService(BaseService):
-    """Elasticsearch service emulator for the honeypot"""
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)  # <-- ensures console output
+    ]
+)
 
+class SSHService(BaseService):
+    """SSH service emulator for the honeypot"""
+    
     def __init__(self, host: str, port: int, config: Dict[str, Any]):
-        """
-        Initialize the Elasticsearch service
+        super().__init__(host, port, config, "ssh")
+        
+        # Generate SSH server key if needed
+        self.key_file = os.path.join("data", "ssh_host_rsa_key")
+        self._ensure_server_key()
+        
+        # Set banner if specified
+        if "banner" in self.service_config:
+            self.banner = self.service_config["banner"]
+        else:
+            self.banner = "SSH-2.0-OpenSSH_7.4p1 Ubuntu-10"
+            
+        # Track command history by session
+        self.command_history = {}
 
-        Args:
-            host: Host IP to bind to
-            port: Port to listen on
-            config: Global configuration dictionary
-        """
-        super().__init__(host, port, config, "elasticsearch")
-
-        # Elasticsearch specific configurations
-        self.server_version = self.service_config.get("server_version", "6.8.0")
-        self.cluster_name = self.service_config.get("cluster_name", "elasticsearch-cluster")
-
-        # Fake indices and data
-        self.indices = ["users", "config", "logs", "transactions", "passwords"]
-        self.fake_data = self._generate_fake_data()
-
-    def _generate_fake_data(self) -> Dict[str, List[Dict[str, Any]]]:
-        """Generate fake data for indices"""
-        data = {}
-
-        # Users index
-        data["users"] = [
-            {"_id": "1", "username": "admin", "email": "admin@example.com", "admin": True},
-            {"_id": "2", "username": "user1", "email": "user1@example.com", "admin": False},
-            {"_id": "3", "username": "system", "email": "system@internal", "admin": True}
-        ]
-
-        # Config index
-        data["config"] = [
-            {"_id": "1", "name": "database", "host": "db-server", "username": "dbuser", "password": "dbpass123"},
-            {"_id": "2", "name": "api", "key": "c5a8ae582c7ee96a6a4bae6e4f476f2e"},
-            {"_id": "3", "name": "email", "smtp_server": "mail.example.com", "username": "notifications", "password": "mailuserpass"}
-        ]
-
-        # Logs index
-        data["logs"] = [
-            {"_id": "1", "timestamp": "2023-01-01T12:00:00Z", "level": "INFO", "message": "System started"},
-            {"_id": "2", "timestamp": "2023-01-01T12:05:00Z", "level": "WARN", "message": "High memory usage detected"},
-            {"_id": "3", "timestamp": "2023-01-01T12:10:00Z", "level": "ERROR", "message": "Failed to connect to database"}
-        ]
-
-        return data
+    def _ensure_server_key(self) -> None:
+        """Ensure SSH server key exists, generate if it doesn't"""
+        os.makedirs(os.path.dirname(self.key_file), exist_ok=True)
+        
+        if not os.path.exists(self.key_file):
+            self.logger.info("Generating SSH host key...")
+            key = paramiko.RSAKey.generate(2048)
+            key.write_private_key_file(self.key_file)
+            self.logger.info(f"SSH host key generated and saved to {self.key_file}")
+    
+    def start(self) -> None:
+        """Start the SSH service properly by listening on a socket"""
+        try:
+            self.sock.bind((self.host, self.port))
+            self.sock.listen(5)
+            self.running = True
+            self.logger.info(f"SSH honeypot started on port {self.port}")
+            
+            while self.running:
+                try:
+                    client, addr = self.sock.accept()
+                    
+                    # Set a timeout for the client socket
+                    client.settimeout(self.config["resource_limits"]["connection_timeout"])
+                    
+                    # Check if we've reached the maximum connections
+                    if self.connection_count >= self.config["network"]["max_connections"]:
+                        self.logger.warning(f"Maximum connections reached, dropping connection from {addr[0]}")
+                        client.close()
+                        continue
+                    
+                    # Increment connection counters
+                    self.connection_count += 1
+                    self._increment_ip_counter(addr[0])
+                    
+                    # Log the connection
+                    self.logger.info(f"Connection from {addr[0]}:{addr[1]} to SSH service")
+                    
+                    # Start a new thread to handle the client
+                    client_handler = threading.Thread(
+                        target=self._handle_client_wrapper,
+                        args=(client, addr)
+                    )
+                    client_handler.daemon = True
+                    client_handler.start()
+                    
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Error accepting connection: {e}")
+                    
+        except Exception as e:
+            self.logger.error(f"Error starting SSH service: {e}")
+        finally:
+            if self.sock:
+                self.sock.close()
 
     def handle_client(self, client_socket: socket.socket, address: Tuple[str, int],
-                     connection_data: Dict[str, Any]) -> None:
-        """
-        Handle a client connection to the Elasticsearch service
-
-        Args:
-            client_socket: Client socket object
-            address: Client address tuple (ip, port)
-            connection_data: Dictionary to store connection data for logging
-        """
-        connection_data["data"]["connection_time"] = datetime.datetime.now().isoformat()
-
-        # Track queries for this session
-        queries = []
-
-        try:
-            self.logger.info(f"Elasticsearch connection from {address[0]}:{address[1]}")
-
-            while True:
-                # Elasticsearch uses HTTP, so receive until we get a complete HTTP request
-                request_data = b""
-                content_length = 0
-                headers_done = False
-
+                          connection_data: Dict[str, Any]) -> None:
+            """
+            Handle an SSH client connection
+            
+            Args:
+                client_socket: Client socket object
+                address: Client address tuple (ip, port)
+                connection_data: Dictionary to store connection data for logging
+            """
+            session_id = f"{address[0]}:{address[1]}:{time.time()}"
+            self.command_history[session_id] = []
+        
+            transport = paramiko.Transport(client_socket)
+            transport.add_server_key(paramiko.RSAKey(filename=self.key_file))
+            server_interface = CustomSSHServerInterface(self)
+        
+            try:
+                self.logger.info(f"[{address}] Starting SSH session")
+                transport.start_server(server=server_interface)
+        
+                chan = transport.accept(10)
+                if chan is None:
+                    self.logger.error(f"[{address}] No channel opened")
+                    return
+        
+                self.logger.info(f"[{address}] Channel accepted")
+        
+                if not server_interface.event.wait(5):
+                    self.logger.error(f"[{address}] Shell not requested in time")
+                    chan.close()
+                    return
+        
+                if not chan.send_ready():
+                    self.logger.warning(f"[{address}] Channel not ready for send()")
+                    chan.close()
+                    return
+        
+                chan.settimeout(15.0)
+                hostname = self.config["deception"]["system_info"]["hostname"]
+                username = server_interface.username or "user"
+        
+                chan.send(b"DEBUG: shell started\r\n")
+                chan.send(f"Welcome to Ubuntu 18.04.5 LTS ({hostname})\r\n".encode())
+                chan.send(f"{username}@{hostname}:~$ ".encode())
+        
+                buffer = ''
+        
                 while True:
-                    chunk = client_socket.recv(4096)
-                    if not chunk:
-                        return
-
-                    request_data += chunk
-
-                    # Check if we've received headers
-                    if not headers_done and b"\r\n\r\n" in request_data:
-                        headers, body = request_data.split(b"\r\n\r\n", 1)
-                        headers_done = True
-
-                        # Extract Content-Length
-                        match = re.search(rb"Content-Length: (\d+)", headers)
-                        if match:
-                            content_length = int(match.group(1))
-
-                    # If we have headers and the complete body, break
-                    if headers_done and len(body) >= content_length:
+                    try:
+                        data = chan.recv(1024)
+                        if not data:
+                            self.logger.info(f"[{address}] Channel closed")
+                            break
+        
+                        decoded = data.decode('utf-8', errors='ignore')
+                        self.logger.info(f"[{address}] RAW input: {repr(decoded)}")
+                        buffer += decoded
+                        chan.send(decoded.encode())  # echo each character back as typed
+        
+                        if '\n' in buffer or '\r' in buffer:
+                            command = buffer.strip().replace('\r', '').replace('\n', '')
+                            buffer = ''
+        
+                            if not command:
+                                chan.send(f"{username}@{hostname}:~$ ".encode())
+                                continue
+        
+                            self.logger.info(f"[{address}] Command received: {command}")
+                            self.command_history[session_id].append({
+                                "command": command,
+                                "timestamp": datetime.datetime.now().isoformat()
+                            })
+        
+                            if command.lower() in ['exit', 'logout', 'quit']:
+                                chan.send(b"logout\r\n")
+                                break
+        
+                            chan.send((command + '\r\n').encode())
+                            response = self.simulate_command_response(command)
+                            if not response.endswith('\n'):
+                                response += '\r\n'
+                            chan.send(response.encode())
+                            chan.send(f"{username}@{hostname}:~$ ".encode())
+        
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        self.logger.error(f"[{address}] Error: {e}")
                         break
-
-                if not request_data:
-                    break
-
-                # Process HTTP request to Elasticsearch
-                http_request = request_data.decode('utf-8', errors='ignore')
-                response, query_info = self._process_http_request(http_request)
-
-                # Log query
-                if query_info:
-                    queries.append(query_info)
-                    connection_data["data"]["queries"] = queries
-
-                # Send response
-                client_socket.send(response.encode())
-
-        except Exception as e:
-            self.logger.error(f"Error handling Elasticsearch client: {e}")
-            connection_data["error"] = str(e)
-        finally:
-            client_socket.close()
-
-    def _handle_root_request(self) -> str:
-        """Handle request to root endpoint - return cluster info"""
-        response_body = json.dumps({
-            "name": "node-1",
-            "cluster_name": self.cluster_name,
-            "cluster_uuid": "Tjs9JeWWQ9G88CArGXzj8g",
-            "version": {
-                "number": self.server_version,
-                "build_flavor": "default",
-                "build_type": "tar",
-                "build_hash": "f27399d",
-                "build_date": "2019-03-11T18:39:09.576086Z",
-                "build_snapshot": False,
-                "lucene_version": "7.7.0"
-            },
-            "tagline": "You Know, for Search"
-        })
-
-        return self._generate_http_response(200, "OK", response_body)
-
-    def _handle_cluster_health(self) -> str:
-        """Handle cluster health request"""
-        response_body = json.dumps({
-            "cluster_name": self.cluster_name,
-            "status": "green",  # Always report healthy
-            "timed_out": False,
-            "number_of_nodes": 3,
-            "number_of_data_nodes": 3,
-            "active_primary_shards": 5,
-            "active_shards": 10,
-            "relocating_shards": 0,
-            "initializing_shards": 0,
-            "unassigned_shards": 0,
-            "delayed_unassigned_shards": 0,
-            "number_of_pending_tasks": 0,
-            "number_of_in_flight_fetch": 0,
-            "task_max_waiting_in_queue_millis": 0,
-            "active_shards_percent_as_number": 100.0
-        })
-
-        return self._generate_http_response(200, "OK", response_body)
-
-    def _handle_cat_indices(self) -> str:
-        """Handle request to list indices"""
-        # Format: health status index uuid pri rep docs.count docs.deleted store.size pri.store.size
-        lines = []
-        for index in self.indices:
-            lines.append(f"green open {index} abcdefghijk123456789 1 1 {random.randint(10, 1000)} 0 {random.randint(1, 100)}kb {random.randint(1, 50)}kb")
-
-        return self._generate_http_response(200, "OK", "\n".join(lines))
-
-    def _handle_search(self, index: str, body: str) -> str:
-        """Handle search request on a specific index"""
-        if index not in self.indices:
-            return self._generate_error_response(404, f"Index '{index}' not found")
-
-        # Log the search attempt - this could be useful for understanding attacker's goals
-        self.logger.info(f"Search request on index '{index}' with body: {body}")
-
-        # Return fake search results
-        hits = []
-        if index in self.fake_data:
-            hits = self.fake_data[index]
-
-        response_body = json.dumps({
-            "took": random.randint(1, 50),
-            "timed_out": False,
-            "_shards": {
-                "total": 1,
-                "successful": 1,
-                "skipped": 0,
-                "failed": 0
-            },
-            "hits": {
-                "total": len(hits),
-                "max_score": 1.0,
-                "hits": [
-                    {
-                        "_index": index,
-                        "_type": "_doc",
-                        "_id": hit["_id"],
-                        "_score": 1.0,
-                        "_source": {k: v for k, v in hit.items() if k != "_id"}
-                    }
-                    for hit in hits
-                ]
-            }
-        })
-
-        return self._generate_http_response(200, "OK", response_body)
-
-    def _handle_search_all(self, body: str) -> str:
-        """Handle search request across all indices"""
-        # Log the search attempt
-        self.logger.info(f"Search request across all indices with body: {body}")
-
-        # Collect hits from all indices
-        all_hits = []
-        for index, hits in self.fake_data.items():
-            for hit in hits:
-                all_hits.append({
-                    "_index": index,
-                    "_type": "_doc",
-                    "_id": hit["_id"],
-                    "_score": 1.0,
-                    "_source": {k: v for k, v in hit.items() if k != "_id"}
-                })
-
-        response_body = json.dumps({
-            "took": random.randint(1, 50),
-            "timed_out": False,
-            "_shards": {
-                "total": len(self.indices),
-                "successful": len(self.indices),
-                "skipped": 0,
-                "failed": 0
-            },
-            "hits": {
-                "total": len(all_hits),
-                "max_score": 1.0,
-                "hits": all_hits
-            }
-        })
-
-        return self._generate_http_response(200, "OK", response_body)
-
-    def _generate_http_response(self, status_code: int, status_text: str, body: str) -> str:
-        """Generate HTTP response"""
-        headers = [
-            f"HTTP/1.1 {status_code} {status_text}",
-            "Content-Type: application/json",
-            f"Content-Length: {len(body)}",
-            f"Date: {datetime.datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT')}",
-            "Connection: close"
-        ]
-
-        return "\r\n".join(headers) + "\r\n\r\n" + body
-
-    def _generate_error_response(self, status_code: int, error_message: str) -> str:
-        """Generate HTTP error response"""
-        body = json.dumps({
-            "error": {
-                "root_cause": [
-                    {
-                        "type": "error",
-                        "reason": error_message
-                    }
-                ],
-                "type": "error",
-                "reason": error_message
-            },
-            "status": status_code
-        })
-
-        return self._generate_http_response(status_code, error_message, body)
         
-    def _process_http_request(self, http_request: str) -> Tuple[str, Dict[str, Any]]:
+            except Exception as e:
+                self.logger.error(f"[{address}] SSH session error: {e}")
+                connection_data["error"] = str(e)
+            finally:
+                try:
+                    chan.close()
+                    transport.close()
+                    client_socket.close()
+                except Exception:
+                    pass
+                connection_data["data"]["command_history"] = self.command_history.pop(session_id, [])
+
+    def simulate_command_response(self, command: str, context: Dict[str, Any] = None) -> str:
         """
-        Process HTTP request to Elasticsearch
-        
-        Args:
-            http_request: HTTP request string
-        
-        Returns:
-            Tuple of (response, query_info)
+        Simulate a response to an SSH command
         """
-        # Parse HTTP request
-        request_lines = http_request.split('\r\n')
-        request_line = request_lines[0] if request_lines else ""
-        
-        # Extract method, path and HTTP version
-        parts = request_line.split(' ')
-        if len(parts) >= 2:
-            method, path = parts[0], parts[1]
-        else:
-            return self._generate_error_response(400, "Bad Request"), {"error": "Invalid request format"}
-        
-        # Extract request body if present
-        body = ""
-        if "\r\n\r\n" in http_request:
-            body = http_request.split("\r\n\r\n", 1)[1]
-        
-        # Build query info for logging
-        query_info = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "method": method,
-            "path": path,
-            "body": body if body else None
-        }
-        
-        # Route request to appropriate handler
-        if path == "/":
-            return self._handle_root_request(), query_info
-        elif path == "/_cluster/health":
-            return self._handle_cluster_health(), query_info
-        elif path == "/_cat/indices":
-            return self._handle_cat_indices(), query_info
-        elif path.startswith("/_search"):
-            return self._handle_search_all(body), query_info
-        elif re.match(r'^/([^/]+)/_search$', path):
-            index = re.match(r'^/([^/]+)/_search$', path).group(1)
-            return self._handle_search(index, body), query_info
-        else:
-            return self._generate_error_response(404, f"Endpoint {path} not found"), query_info
+        interaction_level = self.service_config.get("interaction_level", "medium")
+        hostname = self.config["deception"]["system_info"]["hostname"]
+
+        if command.startswith("cd "):
+            return ""
+
+        elif command == "pwd":
+            return "/home/user\r\n"
+
+        elif command == "whoami":
+            return "user\r\n"
+
+        elif command == "id":
+            return "uid=1000(user) gid=1000(user) groups=1000(user)\r\n"
+
+        elif command == "uname -a":
+            return f"Linux {hostname} {self.config['deception']['system_info']['kernel']} GNU/Linux\r\n"
+
+        elif command == "hostname":
+            return f"{hostname}\r\n"
+
+        elif command.startswith("ls"):
+            if " /etc" in command:
+                return "apache2  cron.d  hosts  motd  passwd  shadow  ssh\r\n"
+            elif " /var" in command:
+                return "backups  cache  lib  log  mail  spool  www\r\n"
+            else:
+                return ".bash_history  .bashrc  .profile  .ssh  documents  secret.txt\r\n"
+
+        elif command == "cat secret.txt":
+            if interaction_level == "high":
+                if self.config["deception"]["breadcrumbs"]:
+                    return (
+                        "Database credentials:\r\n"
+                        "User: dbadmin\r\n"
+                        "Password: Str0ngP@$w0rd\r\n"
+                        "Server: 192.168.1.10\r\n"
+                    )
+                else:
+                    return "Permission denied\r\n"
+            else:
+                return "Permission denied\r\n"
+
+        elif command.startswith("ps"):
+            return (
+                " PID TTY          TIME CMD\r\n"
+                " 1234 pts/0    00:00:00 bash\r\n"
+                " 5678 pts/0    00:00:00 ps\r\n"
+            )
+
+        elif command.startswith("netstat") or command.startswith("ss"):
+            return (
+                "tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN\r\n"
+                "tcp        0      0 0.0.0.0:80              0.0.0.0:*               LISTEN\r\n"
+                "tcp        0      0 127.0.0.1:3306          0.0.0.0:*               LISTEN\r\n"
+            )
+
+        elif command.startswith("ifconfig") or command.startswith("ip a"):
+            return (
+                "eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\r\n"
+                "        inet 192.168.1.100  netmask 255.255.255.0  broadcast 192.168.1.255\r\n"
+            )
+
+        elif command.startswith("wget") or command.startswith("curl"):
+            if any(x in command for x in [".sh", ".pl", ".py", ".bin", ".elf", ".malware"]):
+                self.logger.warning(f"Possible malware download attempt: {command}")
+            return "Connecting...\r\nHTTP request sent, awaiting response... 404 Not Found\r\n"
+
+        elif "passwd" in command:
+            return "Changing password for user.\r\nCurrent password: \r\n"
+
+        elif command.startswith("sudo"):
+            return "[sudo] password for user: Sorry, try again.\r\n"
+
+        return f"Command not found: {command}\r\n"
+
+class CustomSSHServerInterface(paramiko.ServerInterface):
+    def __init__(self, service: SSHService):
+        self.event = threading.Event()
+        self.service = service
+        self.username = ""
+
+    def check_auth_password(self, username, password):
+        self.username = username
+        return paramiko.AUTH_SUCCESSFUL if self.service.is_valid_credentials(username, password) else paramiko.AUTH_FAILED
+
+    def get_allowed_auths(self, username):
+        return 'password'
+
+    def check_channel_request(self, kind, chanid):
+        return paramiko.OPEN_SUCCEEDED if kind == 'session' else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+    def check_channel_pty_request(self, channel, term, width, height, pixelwidth, pixelheight, modes):
+        return True
+
+    def check_channel_shell_request(self, channel):
+        self.event.set()
+        return True
