@@ -130,67 +130,6 @@ class ElasticsearchService(BaseService):
         finally:
             client_socket.close()
 
-def _process_http_request(self, request: str) -> Tuple[str, Optional[Dict[str, Any]]]:
-        """
-        Process HTTP request to Elasticsearch
-
-        Args:
-            request: Raw HTTP request
-
-        Returns:
-            Tuple of (HTTP response, query info dict or None)
-        """
-        # Basic HTTP request parsing
-        request_lines = request.strip().split('\r\n')
-        if not request_lines:
-            return self._generate_error_response(400, "Bad Request"), None
-
-        # Parse request line
-        request_line = request_lines[0].split()
-        if len(request_line) < 3:
-            return self._generate_error_response(400, "Bad Request"), None
-
-        method, path, _ = request_line
-
-        # Extract headers
-        headers = {}
-        i = 1
-        while i < len(request_lines) and request_lines[i]:
-            if ': ' in request_lines[i]:
-                key, value = request_lines[i].split(': ', 1)
-                headers[key.lower()] = value
-            i += 1
-
-        # Extract body if present
-        body = ""
-        if i < len(request_lines) - 1:
-            body = '\r\n'.join(request_lines[i+1:])
-
-        # Log the request
-        query_info = {
-            "method": method,
-            "path": path,
-            "body": body,
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-
-        self.logger.info(f"Elasticsearch request: {method} {path}")
-
-        # Handle different endpoints
-        if path == "/" and method == "GET":
-            return self._handle_root_request(), query_info
-        elif path == "/_cluster/health" and method == "GET":
-            return self._handle_cluster_health(), query_info
-        elif path == "/_cat/indices" and method == "GET":
-            return self._handle_cat_indices(), query_info
-        elif re.match(r"/(\w+)/_search", path) and method == "GET":
-            index = path.split('/')[1]
-            return self._handle_search(index, body), query_info
-        elif path == "/_search" and method == "GET":
-            return self._handle_search_all(body), query_info
-        else:
-            return self._generate_error_response(404, "Not Found"), query_info
-
     def _handle_root_request(self) -> str:
         """Handle request to root endpoint - return cluster info"""
         response_body = json.dumps({
