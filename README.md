@@ -1,179 +1,177 @@
-# Jebakan - Honeypot System
+# Jebakan -  A Python Honeypot System
 
-A modular Python-based honeypot system for cybersecurity research and threat intelligence gathering. This honeypot emulates multiple network services to attract and analyze attack patterns.
+Jebakan - A comprehensive, modular honeypot system written in Python for cybersecurity research, threat intelligence gathering, and network security monitoring.
+
+## Overview
+
+This honeypot system creates convincing decoy services to attract and study attackers without exposing your real systems. It's designed to be highly configurable, easy to deploy, and capable of detailed logging and analysis of attack patterns.
 
 ## Features
 
-- **Multi-Service Emulation**: SSH, HTTP, FTP, and Telnet services
-- **Configurable Interaction Levels**: Low, medium, and high interaction levels for each service
-- **Comprehensive Logging**: Detailed logging of all attacker interactions
-- **Authentication Traps**: Fake authentication systems to capture credentials
-- **Real-time Alerts**: Email and webhook notifications for suspicious activities
-- **Data Analytics**: Built-in analytics engine for attack pattern recognition
-- **Web Dashboard**: Visual dashboard for monitoring honeypot activity
-- **Breadcrumb Deployment**: Configurable breadcrumbs to attract advanced attackers
-- **Modular Architecture**: Easily extensible to add new service emulators
+### Core Functionality
+- **Modular Architecture**: Easily add or customize service emulators
+- **Multiple Service Emulation**: SSH, HTTP, FTP, Telnet, MySQL, MSSQL, Redis, Elasticsearch, Docker API, RDP, VNC
+- **Flexible Configuration**: JSON-based configuration with command-line overrides
+- **Interaction Levels**: Configure low, medium, or high interaction for different honeypot scenarios
+- **Comprehensive Logging**: Detailed logs of all interactions for later analysis
 
-## System Requirements
+### Security Features
+- **Isolated Environment**: Designed to safely contain and monitor attacker activities
+- **Resource Limiting**: Prevent DoS attacks with connection limits and timeouts
+- **Port Availability Checking**: Automatically checks if ports are available before starting services
+- **Secure Defaults**: All emulated services run with the minimum required privileges
 
-- Python 3.7+
-- Required Python packages (see requirements.txt)
-- At least 512MB RAM
-- 1GB free disk space
-- Internet connection (for sending alerts and gathering IP intelligence)
+### Analysis and Monitoring
+- **Real-time Alerts**: Configurable alerts for suspicious activities
+- **Attack Pattern Recognition**: Identifies common attack patterns and tools
+- **Dashboard**: Web-based dashboard for monitoring honeypot activity
+- **Analytics Engine**: Process and visualize attack data
+- **JSON Log Format**: Easy integration with existing SIEM and analysis tools
+
+### Deception Techniques
+- **Configurable Banners**: Customize service banners to mimic different systems
+- **Breadcrumbs**: Plant convincing fake credentials and sensitive information
+- **Realistic Responses**: Service emulators provide realistic feedback to common commands
+- **System Information Spoofing**: Configure OS and service versions to target specific threats
 
 ## Installation
 
+### Prerequisites
+- Python 3.8+
+- Required Python packages:
+  - paramiko
+  - colorama
+  - flask (for dashboard)
+
+### Quick Start
+
 1. Clone the repository:
    ```
-   git clone https://github.com/yourusername/python-honeypot.git
+   git clone https://github.com/username/python-honeypot.git
    cd python-honeypot
    ```
 
-2. Create a virtual environment:
-   ```
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. Install the required dependencies:
+2. Install dependencies:
    ```
    pip install -r requirements.txt
    ```
 
-4. Create the initial directory structure:
+3. Create a basic configuration:
    ```
-   mkdir -p data/http data/ftp logs config
-   ```
-
-5. Generate the default configuration file:
-   ```
-   python honeypot.py --generate-config
+   mkdir -p config
+   cp examples/config.json config/honeypot.json
    ```
 
-## Configuration
+4. Run the honeypot:
+   ```
+   python honeypot.py
+   ```
 
-The honeypot is configured using a JSON file located at `config/honeypot.json`. The default configuration will be generated if this file doesn't exist.
+### Command Line Options
 
-Key configuration options:
+```
+python honeypot.py [-h] [-c CONFIG] [-v] [-n] [--interaction {low,medium,high}] [--services SERVICES]
+```
 
-- **Network Settings**: IP binding and connection limits
-- **Service Configuration**: Enable/disable services and set ports
-- **Logging Settings**: Log file locations and rotation policies
-- **Authentication**: Credentials for each service
-- **Alert Settings**: Email and webhook notification setup
-- **Dashboard**: Web interface configuration
+Options:
+- `-h, --help`: Show help message
+- `-c, --config CONFIG`: Path to configuration file (default: config/honeypot.json)
+- `-v, --verbose`: Increase output verbosity
+- `-n, --no-prompt`: Start with default services (no interactive prompt)
+- `--interaction {low,medium,high}`: Set global interaction level
+- `--services SERVICES`: Comma-separated list of services to enable or 'all'
 
-Example configuration:
+## Service Configuration
+
+Each service can be independently configured:
 
 ```json
 {
-  "network": {
-    "bind_ip": "0.0.0.0",
-    "max_connections": 100
-  },
   "services": {
     "ssh": {
       "enabled": true,
       "port": 2222,
+      "interaction_level": "medium",
       "banner": "SSH-2.0-OpenSSH_7.4p1 Ubuntu-10",
-      "interaction_level": "medium"
+      "credentials": [
+        {"username": "admin", "password": "password1"},
+        {"username": "root", "password": "toor"}
+      ]
     },
-    "http": {
-      "enabled": true,
-      "port": 8080,
-      "server_name": "Apache/2.4.41 (Ubuntu)",
-      "interaction_level": "medium"
-    },
-    "ftp": {
-      "enabled": true,
-      "port": 2121,
-      "banner": "220 FTP Server Ready",
-      "interaction_level": "medium"
-    },
-    "telnet": {
-      "enabled": true,
-      "port": 2323,
-      "banner": "Ubuntu 18.04 LTS",
-      "interaction_level": "medium"
-    }
+    ...
   }
 }
 ```
 
-## Usage
+## Dashboard
 
-### Starting the Honeypot
+The built-in web dashboard provides:
+- Real-time activity monitoring
+- Attack visualization
+- Geographic attacker distribution
+- Login attempt statistics
+- Service-specific analytics
 
-```
-python honeypot.py
-```
-
-### Command-Line Options
-
-- `--config`: Specify a custom configuration file path
-- `--verbose`: Enable verbose debugging output
-- `--generate-config`: Generate a default configuration file
-- `--service`: Start only specific services (e.g., `--service ssh http`)
-
-### Dashboard Access
-
-The web dashboard is available at `http://your-server-ip:8000` (default port). Login credentials are specified in the configuration file.
+Access the dashboard at `http://localhost:8080` when enabled.
 
 ## Security Considerations
 
 - **Network Isolation**: Always run honeypots in isolated networks
-- **Firewall Rules**: Set up proper firewall rules to protect your infrastructure
-- **Regular Monitoring**: Check logs regularly for signs of containment bypass
-- **Resource Limits**: Configure resource limits to prevent DoS conditions
+- **Resource Monitoring**: Monitor system resources to prevent compromise
 - **Legal Compliance**: Ensure your honeypot deployment complies with local laws
+- **Data Privacy**: Be mindful of what data you collect and how you store it
 
-## Extending the Honeypot
+## Project Structure
 
-### Adding a New Service
-
-1. Create a new service module in the `services` directory
-2. Extend the `BaseService` class
-3. Implement the `handle_client` method
-4. Update the configuration schema
-5. Register the service in `honeypot.py`
-
-Example service module template:
-
-```python
-from services.base_service import BaseService
-
-class MyService(BaseService):
-    def __init__(self, host, port, config):
-        super().__init__(host, port, config, "myservice")
-        
-    def handle_client(self, client_socket, address, connection_data):
-        # Implement service-specific logic here
-        pass
+```
+python-honeypot/
+├── honeypot.py          # Main application
+├── config/              # Configuration files
+├── data/                # Data files for services
+├── logs/                # Log output
+├── services/            # Service emulators
+│   ├── base_service.py  # Base service class
+│   ├── ssh_service.py
+│   ├── http_service.py
+│   └── ...
+└── utils/               # Utility modules
+    ├── config_manager.py
+    ├── analytics.py
+    ├── dashboard.py
+    └── alert_manager.py
 ```
 
-## Analytics and Reporting
+## Contributing
 
-The honeypot includes an analytics engine that processes collected data and generates various reports:
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-- Connection statistics
-- Authentication attempt analysis
-- Command execution patterns
-- Attack pattern recognition
-- Geographic IP distribution
-
-Reports are automatically generated in the `data/reports` directory.
-
-## Troubleshooting
-
-### Common Issues
-
-- **Service won't start**: Check if ports are already in use
-- **Database errors**: Verify database file permissions
-- **Email alerts not working**: Check SMTP server configuration
-- **High CPU usage**: Adjust the resource limits in configuration
-- **Dashboard unavailable**: Verify network connectivity and firewall rules
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+**Author**: Keith Pachulski  
+**Company**: Red Cell Security, LLC  
+**Email**: keith@redcellsecurity.org  
+**Website**: www.redcellsecurity.org  
+
+© 2025 Keith Pachulski. All rights reserved.
+
+**License**: This software is licensed under the MIT License. You are free to use, modify, and distribute this software in accordance with the terms of the license.
+
+## Support My Work
+
+If you find my work useful and want to support continued development, you can donate here:
+
+[![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://paypal.me/sec0ps)
+
+> **DISCLAIMER**:  
+> This software is provided "as-is," without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement. In no event shall the authors or copyright holders
+> be liable for any claim, damages, or other liability, whether in an action of contract, tort, or otherwise, arising from, out of, or in connection with the software or the use or other dealings in the software.
+
+## Disclaimer
+
+This tool is for educational and research purposes only. Users are responsible for how they deploy and use this honeypot system. Always obtain proper authorization before deploying honeypots in production environments.
