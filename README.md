@@ -1,4 +1,4 @@
-# Python Honeypot System
+# Jebakan - Honeypot System
 
 A modular Python-based honeypot system for cybersecurity research and threat intelligence gathering. This honeypot emulates multiple network services to attract and analyze attack patterns.
 
