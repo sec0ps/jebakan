@@ -22,12 +22,12 @@ from colorama import Fore, Style, init
 init(autoreset=True)
 
 # Import service modules
-#from services.ssh_service import SSHService
-#from services.http_service import HTTPService
-#from services.ftp_service import FTPService
-#from services.telnet_service import TelnetService
-#from services.mysql_service import MySQLService
-#from services.mssql_service import MSSQLService
+from services.ssh_service import SSHService
+from services.http_service import HTTPService
+from services.ftp_service import FTPService
+from services.telnet_service import TelnetService
+from services.mysql_service import MySQLService
+from services.mssql_service import MSSQLService
 
 # Import utilities
 from utils.config_manager import load_config, save_config
