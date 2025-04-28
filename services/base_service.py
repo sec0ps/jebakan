@@ -1,32 +1,3 @@
-# =============================================================================
-# Jebakan - Python-Based Honeypot System
-# =============================================================================
-#
-# Author: Keith Pachulski
-# Company: Red Cell Security, LLC
-# Email: keith@redcellsecurity.org
-# Website: www.redcellsecurity.org
-#
-# Copyright (c) 2025 Keith Pachulski. All rights reserved.
-#
-# License: This software is licensed under the MIT License.
-#          You are free to use, modify, and distribute this software
-#          in accordance with the terms of the license.
-#
-# Purpose: This module is part of the Jebakan honeypot system, designed to
-#          create convincing decoy systems to attract and detect attackers.
-#          It provides service emulation, attack logging, and threat intelligence
-#          gathering capabilities for cybersecurity research and network protection.
-#
-# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
-#             express or implied, including but not limited to the warranties
-#             of merchantability, fitness for a particular purpose, and non-infringement.
-#             In no event shall the authors or copyright holders be liable for any claim,
-#             damages, or other liability, whether in an action of contract, tort, or otherwise,
-#             arising from, out of, or in connection with the software or the use or other dealings
-#             in the software.
-#
-# =============================================================================
 #!/usr/bin/env python3
 """
 Base service class for honeypot services
@@ -118,12 +89,22 @@ class BaseService:
             if self.sock:
                 self.sock.close()
     
-    def stop(self) -> None:
-        """Stop the service"""
+    def stop(self):
+        """Stop the service and clean up resources"""
         self.running = False
-        if self.sock:
-            self.sock.close()
-        self.logger.info(f"{self.service_name.upper()} honeypot stopped")
+        
+        if hasattr(self, 'sock'):
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
+            try:
+                self.sock.close()
+                self.logger.info(f"{self.service_name} socket closed")
+            except Exception as e:
+                self.logger.error(f"Error closing {self.service_name} socket: {e}")
+        
+        self.logger.info(f"{self.service_name} service stopped")
     
     def _handle_client_wrapper(self, client_socket: socket.socket, address: Tuple[str, int]) -> None:
         """
