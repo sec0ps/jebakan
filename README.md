@@ -56,13 +56,7 @@ This honeypot system creates convincing decoy services to attract and study atta
    pip install -r requirements.txt
    ```
 
-3. Create a basic configuration:
-   ```
-   mkdir -p config
-   cp examples/config.json config/honeypot.json
-   ```
-
-4. Run the honeypot:
+3. Run the honeypot:
    ```
    python jebakan.py
    ```
