@@ -28,9 +28,6 @@
 #
 # =============================================================================
 #!/usr/bin/env python3
-"""
-Honeypot - A modular Python honeypot system for cybersecurity research
-"""
 
 import socket
 import threading
@@ -43,7 +40,7 @@ import argparse
 import signal
 import sys
 import re
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Tuple, Optional
 import colorama
 from colorama import Fore, Style, init
 
@@ -72,7 +69,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stdout)  # <-- ensures console output
+        logging.StreamHandler(sys.stdout)
     ]
 )
 
@@ -99,10 +96,61 @@ def setup_logging(config):
 
 def signal_handler(sig, frame):
     """Handle interrupt signals gracefully"""
-    global running
+    global running, active_services, logger
+    
     print("\nShutting down honeypot services...")
     running = False
+    
+    # Clean up services before exit
+    cleanup_services(active_services)
+    
     sys.exit(0)
+
+def cleanup_services(active_services):
+    """
+    Clean up all running services and release ports
+    
+    Args:
+        active_services: List of tuples containing (service_name, service_object, thread)
+    """
+    global logger
+    
+    print(f"{Fore.YELLOW}Cleaning up services and releasing ports...{Style.RESET_ALL}")
+    
+    for service_name, service_obj, thread in active_services:
+        try:
+            # Stop the service if it has a stop method
+            if hasattr(service_obj, 'stop'):
+                service_obj.stop()
+                logger.info(f"Stopped {service_name} service")
+            
+            # Ensure socket is closed
+            if hasattr(service_obj, 'sock'):
+                try:
+                    service_obj.sock.shutdown(socket.SHUT_RDWR)
+                except:
+                    pass
+                try:
+                    service_obj.sock.close()
+                    logger.info(f"Closed socket for {service_name}")
+                except:
+                    pass
+            
+            # Set running flag to False if exists
+            if hasattr(service_obj, 'running'):
+                service_obj.running = False
+        except Exception as e:
+            logger.error(f"Error cleaning up {service_name}: {e}")
+    
+    # Give threads a moment to clean up
+    time.sleep(1)
+    
+    # Force kill any remaining threads
+    for service_name, service_obj, thread in active_services:
+        if thread.is_alive():
+            logger.warning(f"Force stopping thread for {service_name}")
+            
+    print(f"{Fore.GREEN}Services cleaned up successfully{Style.RESET_ALL}")
 
 def check_port_available(host, port):
     """Check if a port is available on the host"""
@@ -113,6 +161,76 @@ def check_port_available(host, port):
             return True
         except OSError:
             return False
+
+class UnifiedLogger:
+    """Unified logger for all honeypot activities with SIEM integration"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.logger = logging.getLogger("unified_logger")
+        self.log_dir = config.get("logging", {}).get("dir", "logs/")
+        self.unified_log_file = os.path.join(self.log_dir, "honeypot_attacks.json")
+        self.siem_config = config.get("siem-server", None)
+        
+        if not os.path.exists(self.log_dir):
+            os.makedirs(self.log_dir)
+        
+        if not os.path.exists(self.unified_log_file):
+            with open(self.unified_log_file, 'w') as f:
+                f.write("")
+        
+        if self.siem_config:
+            self.siem_sender = threading.Thread(target=self._siem_sender_thread, daemon=True)
+            self.siem_sender.start()
+            self.logger.info(f"SIEM logging enabled to {self.siem_config['ip_address']}:{self.siem_config['port']}")
+    
+    def log_attack(self, service: str, attacker_ip: str, attacker_port: int, 
+                   command: str, additional_data: Dict[str, Any] = None) -> None:
+        log_entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "service": service,
+            "attacker_ip": attacker_ip,
+            "attacker_port": attacker_port,
+            "command": command,
+            "additional_data": additional_data or {}
+        }
+        
+        with open(self.unified_log_file, 'a') as f:
+            f.write(json.dumps(log_entry) + "\n")
+    
+    def _siem_sender_thread(self) -> None:
+        last_sent_position = 0
+        
+        while True:
+            try:
+                if os.path.exists(self.unified_log_file):
+                    with open(self.unified_log_file, 'r') as f:
+                        f.seek(last_sent_position)
+                        new_lines = f.readlines()
+                        
+                        if new_lines:
+                            for line in new_lines:
+                                if line.strip():
+                                    self._send_to_siem(line.strip())
+                            
+                            last_sent_position = f.tell()
+                
+                time.sleep(5)
+                
+            except Exception as e:
+                self.logger.error(f"Error in SIEM sender thread: {e}")
+                time.sleep(10)
+    
+    def _send_to_siem(self, log_entry: str) -> None:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5)
+                sock.connect((self.siem_config["ip_address"], int(self.siem_config["port"])))
+                sock.sendall((log_entry + "\n").encode('utf-8'))
+                self.logger.debug(f"Sent log to SIEM: {log_entry}")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to send log to SIEM: {e}")
 
 def print_banner():
     """Print the honeypot banner"""
@@ -171,6 +289,8 @@ def print_service_menu(config):
     print(f"{Fore.CYAN}d. {Fore.WHITE}Enable dashboard")
     print(f"{Fore.CYAN}a. {Fore.WHITE}Enable analytics")
     print(f"{Fore.CYAN}q. {Fore.WHITE}Quit")
+    print(f"  S. Configure SIEM")
+    print(f"  Q. Quit\n")
 
 def main():
     global logger, running
@@ -235,7 +355,7 @@ def main():
     alert_manager = AlertManager(config)
     analytics_engine = AnalyticsEngine(config) if enable_analytics else None
 
-    started_services = start_services(config, services_to_enable)
+    started_services = start_services(config, services_to_enable, unified_logger)
 
     if enable_analytics and analytics_engine:
         analytics_thread = threading.Thread(target=analytics_engine.start)
@@ -267,16 +387,26 @@ def main():
     except KeyboardInterrupt:
         running = False
         logger.info("Shutting down honeypot...")
+        cleanup_services(active_services)  # Add cleanup here too
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        cleanup_services(active_services)
+    finally:
+        cleanup_services(active_services)  # Add final cleanup
+
+    try:
+        while running:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        running = False
+        logger.info("Shutting down honeypot...")
 
 def select_services(config, args):
     """Prompt user to select services to enable"""
     from utils.config_manager import save_config
-
     if "global_interaction_level" not in config:
         config["global_interaction_level"] = args.interaction or "high"
-
     print_service_menu(config)
-
     service_map = [
         "ssh", "http", "ftp", "telnet", "mysql", "mssql",
         "rdp", "vnc", "redis", "elasticsearch", "docker"
@@ -286,27 +416,57 @@ def select_services(config, args):
         "mysql": 3306, "mssql": 1433, "rdp": 3389, "vnc": 5900,
         "redis": 6379, "elasticsearch": 9200, "docker": 2375
     }
-
     while True:
         try:
             raw = input(f"\n{Fore.GREEN}Enter your selection: {Style.RESET_ALL}")
             cleaned = raw.strip().lower()
             print(f"[DEBUG] Raw input: {repr(raw)}")
-
             if cleaned == 'q':
                 return None, False, False
-
             enable_dashboard = 'd' in cleaned
             enable_analytics = 'a' in cleaned
-
+            
+            # Add SIEM configuration option
+            if cleaned == 's':
+                print(f"\n{Fore.CYAN}=== SIEM Configuration ==={Style.RESET_ALL}")
+                ip_address = input("Enter SIEM server IP address: ").strip()
+                port = input("Enter SIEM server port: ").strip()
+                
+                try:
+                    socket.inet_aton(ip_address)
+                    port = int(port)
+                    if not (1 <= port <= 65535):
+                        raise ValueError("Port must be between 1 and 65535")
+                    
+                    # Add SIEM configuration to services
+                    if "services" not in config:
+                        config["services"] = {}
+                    
+                    config["services"]["siem"] = {
+                        "enabled": True,
+                        "ip_address": ip_address,
+                        "port": port
+                    }
+                    
+                    # Save configuration immediately
+                    save_config(config, args.config)
+                    print(f"{Fore.GREEN}SIEM configuration saved successfully{Style.RESET_ALL}")
+                    
+                except socket.error:
+                    print(f"{Fore.RED}Invalid IP address format{Style.RESET_ALL}")
+                except ValueError as e:
+                    print(f"{Fore.RED}Invalid port: {e}{Style.RESET_ALL}")
+                except Exception as e:
+                    print(f"{Fore.RED}Error updating configuration: {e}{Style.RESET_ALL}")
+                
+                continue  # Return to menu after configuring SIEM
+            
             # Do NOT remove 'a' or 'd' until AFTER checking 'all'
             if cleaned == 'all':
                 cleaned = ','.join(str(i) for i in range(1, len(service_map) + 1))
                 print(f"[DEBUG] Interpreting 'all' as: {cleaned}")
-
             # Now safely strip dashboard/analytics flags
             cleaned = cleaned.replace('d', '').replace('a', '').replace(' ', '')
-
             selected_services = []
             for part in cleaned.split(','):
                 if part.isdigit():
@@ -315,9 +475,7 @@ def select_services(config, args):
                         selected_services.append(service_map[idx])
                 elif part in service_map:
                     selected_services.append(part)
-
             print(f"[DEBUG] Selected services: {selected_services}")
-
             services_to_enable = []
             for svc in selected_services:
                 config["services"].setdefault(svc, {
@@ -327,21 +485,17 @@ def select_services(config, args):
                 })
                 config["services"][svc]["enabled"] = True
                 config["services"][svc].setdefault("interaction_level", config["global_interaction_level"])
-
                 services_to_enable.append(svc)
-
             if not services_to_enable and not enable_dashboard and not enable_analytics:
                 print(f"{Fore.RED}No valid services selected. Please try again.")
                 continue
-
             save_config(config, args.config)
             logger.info(f"Saved configuration to {args.config}")
             return services_to_enable, enable_dashboard, enable_analytics
-
         except Exception as e:
             print(f"{Fore.RED}Error: {e}. Please try again.")
 
-def start_services(config, services_to_enable):
+def start_services(config, services_to_enable, unified_logger=None):
     """Start all enabled services based on configuration"""
     global active_services
 
@@ -719,7 +873,47 @@ def main():
         help=f"Comma-separated list of services to enable or 'all'. Options: {service_choices}",
         type=str
     )
+    parser.add_argument("config-siem", nargs='?', help="Configure SIEM integration")
     args = parser.parse_args()
+
+    # Check for config-siem command
+    if len(sys.argv) > 1 and sys.argv[1] == "config-siem":
+        print("\n=== SIEM Configuration ===")
+        ip_address = input("Enter SIEM server IP address: ").strip()
+        port = input("Enter SIEM server port: ").strip()
+        
+        try:
+            socket.inet_aton(ip_address)
+            port = int(port)
+            if not (1 <= port <= 65535):
+                raise ValueError("Port must be between 1 and 65535")
+            
+            with open(args.config, 'r') as f:
+                config = json.load(f)
+            
+            # Create siem service at the same level as other services
+            if "services" not in config:
+                config["services"] = {}
+            
+            config["services"]["siem"] = {
+                "enabled": True,
+                "ip_address": ip_address,
+                "port": port
+            }
+            
+            with open(args.config, 'w') as f:
+                json.dump(config, f, indent=4)
+            
+            print("SIEM configuration saved successfully")
+            
+        except socket.error:
+            print("Invalid IP address format")
+        except ValueError as e:
+            print(f"Invalid port: {e}")
+        except Exception as e:
+            print(f"Error updating configuration: {e}")
+        
+        sys.exit(0)
 
     # Print banner
     print_banner()
@@ -741,6 +935,9 @@ def main():
     # Set up logging
     logger = setup_logging(config)
     logger.info("Starting honeypot system...")
+
+    # Initialize unified logger (add this line)
+    unified_logger = UnifiedLogger(config)
 
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -781,7 +978,7 @@ def main():
     if enable_analytics:
         analytics_engine = AnalyticsEngine(config)
 
-    # Start services
+    # Start services (modify to pass unified_logger)
     started_services = start_services(config, services_to_enable)
 
     # Save updated interaction level if set via CLI
