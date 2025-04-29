@@ -30,3 +30,6 @@ pytest-cov>=3.0.0       # Coverage reports
 black>=22.1.0           # Code formatter
 flake8>=4.0.1           # Linter
 mypy>=0.931             # Static type checking
+
+#GeoIP Database
+geoip2
