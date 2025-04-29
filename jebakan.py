@@ -44,17 +44,20 @@ import geoip2.database
 from typing import Dict, Any, Tuple, Optional
 import colorama
 from colorama import Fore, Style, init
+from utils.config_manager import load_config, save_config
 
 # Initialize colorama for colored terminal output
 init(autoreset=True)
 
-# Import utilities
-from utils.config_manager import load_config, save_config
-
-# Global variables
 running = True
 active_services = []
 logger = None
+
+# Define the base directory as the directory containing jebakan.py
+base_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Now you can use this base_dir to construct paths to other files and directories
+config_path = os.path.join(base_dir, "honeypot.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,6 +166,15 @@ class UnifiedLogger:
         self.unified_log_file = os.path.join(self.log_dir, "honeypot_attacks.json")
         self.siem_config = config.get("siem-server", None)
         self.geoip_db_path = config.get("geoip_db_path", "GeoLite2-City.mmdb")
+        self.siem_position_file = os.path.join(self.log_dir, "siem_last_position.txt")
+        self.siem_queue_file = os.path.join(self.log_dir, "siem_queue.json")
+        
+        # SIEM connection state
+        self.siem_connected = False
+        self.last_connection_attempt = 0
+        self.connection_retry_interval = 30  # seconds
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 3  # After this many failures, we'll mark as disconnected
         
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
@@ -170,6 +182,11 @@ class UnifiedLogger:
         if not os.path.exists(self.unified_log_file):
             with open(self.unified_log_file, 'w') as f:
                 f.write("")
+                
+        # Initialize queue file if it doesn't exist
+        if not os.path.exists(self.siem_queue_file):
+            with open(self.siem_queue_file, 'w') as f:
+                f.write("[]")
         
         # Load GeoIP database if available
         self.geoip_reader = None
@@ -181,19 +198,23 @@ class UnifiedLogger:
                 self.logger.error(f"Failed to load GeoIP database: {e}")
 
         if self.siem_config:
+            # Start with a connection test
+            self._check_siem_connection()
+            
+            # Start the sender thread
             self.siem_sender = threading.Thread(target=self._siem_sender_thread, daemon=True)
             self.siem_sender.start()
             self.logger.info(f"SIEM logging enabled to {self.siem_config['ip_address']}:{self.siem_config['port']}")
     
     def log_attack(self, service: str, attacker_ip: str, attacker_port: int, 
                    command: str, additional_data: Dict[str, Any] = None) -> None:
+        """Log an attack to the unified log file"""
         log_entry = {
             "timestamp": datetime.datetime.now().isoformat(),
             "service": service,
             "attacker_ip": attacker_ip,
             "attacker_port": attacker_port,
-            "command": command,
-            "additional_data": additional_data or {}
+            "command": command
         }
 
         # Add geolocation enrichment
@@ -210,42 +231,210 @@ class UnifiedLogger:
             except Exception:
                 log_entry["geolocation"] = {}
 
+        # Add additional data if provided
+        if additional_data:
+            log_entry["additional_data"] = additional_data
+
+        # Write to unified log file
         with open(self.unified_log_file, 'a') as f:
             f.write(json.dumps(log_entry) + "\n")
     
+    def _load_last_position(self) -> int:
+        """Load the last position sent to SIEM from file"""
+        try:
+            if os.path.exists(self.siem_position_file):
+                with open(self.siem_position_file, 'r') as f:
+                    content = f.read().strip()
+                    if content:
+                        return int(content)
+            return 0
+        except Exception as e:
+            self.logger.error(f"Error loading last SIEM position: {e}")
+            return 0
+    
+    def _save_last_position(self, position: int) -> None:
+        """Save the last position sent to SIEM to file"""
+        try:
+            with open(self.siem_position_file, 'w') as f:
+                f.write(str(position))
+        except Exception as e:
+            self.logger.error(f"Error saving last SIEM position: {e}")
+    
+    def _load_queue(self) -> list:
+        """Load the queue of logs waiting to be sent to SIEM"""
+        try:
+            if os.path.exists(self.siem_queue_file):
+                with open(self.siem_queue_file, 'r') as f:
+                    content = f.read().strip()
+                    if content:
+                        return json.loads(content)
+            return []
+        except Exception as e:
+            self.logger.error(f"Error loading SIEM queue: {e}")
+            return []
+    
+    def _save_queue(self, queue: list) -> None:
+        """Save the queue of logs waiting to be sent to SIEM"""
+        try:
+            with open(self.siem_queue_file, 'w') as f:
+                f.write(json.dumps(queue))
+        except Exception as e:
+            self.logger.error(f"Error saving SIEM queue: {e}")
+    
+    def _add_to_queue(self, log_entry: str) -> None:
+        """Add a log entry to the queue for later sending"""
+        try:
+            queue = self._load_queue()
+            queue.append(log_entry)
+            self._save_queue(queue)
+            self.logger.debug(f"Added log to SIEM queue. Queue size: {len(queue)}")
+        except Exception as e:
+            self.logger.error(f"Error adding to SIEM queue: {e}")
+    
+    def _process_queue(self) -> None:
+        """Process all entries in the queue and try to send them to SIEM"""
+        if not self.siem_connected:
+            return
+            
+        queue = self._load_queue()
+        if not queue:
+            return
+            
+        self.logger.info(f"Attempting to process SIEM queue with {len(queue)} entries")
+        remaining_queue = []
+        
+        for log_entry in queue:
+            send_success = self._send_to_siem(log_entry)
+            if not send_success:
+                # If send fails, keep this entry and all remaining ones in the queue
+                remaining_queue.append(log_entry)
+                remaining_queue.extend(queue[queue.index(log_entry) + 1:])
+                break
+                
+        if len(remaining_queue) < len(queue):
+            self.logger.info(f"Successfully sent {len(queue) - len(remaining_queue)} queued logs to SIEM")
+        
+        self._save_queue(remaining_queue)
+    
+    def _check_siem_connection(self) -> bool:
+        """Test the connection to the SIEM server"""
+        current_time = time.time()
+        
+        # Only try to reconnect every connection_retry_interval seconds
+        if (not self.siem_connected and 
+            current_time - self.last_connection_attempt < self.connection_retry_interval):
+            return self.siem_connected
+            
+        self.last_connection_attempt = current_time
+        
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5)
+                sock.connect((self.siem_config["ip_address"], int(self.siem_config["port"])))
+                
+                # If we get here, connection succeeded
+                if not self.siem_connected:
+                    self.logger.info(f"SIEM connection established to {self.siem_config['ip_address']}:{self.siem_config['port']}")
+                
+                self.siem_connected = True
+                self.consecutive_failures = 0
+                return True
+                
+        except Exception as e:
+            self.consecutive_failures += 1
+            
+            if self.siem_connected:
+                self.logger.warning(f"SIEM connection lost: {e}")
+                
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                if self.siem_connected:
+                    self.logger.error(f"SIEM connection marked as down after {self.consecutive_failures} consecutive failures")
+                self.siem_connected = False
+            
+            return False
+    
     def _siem_sender_thread(self) -> None:
-        last_sent_position = 0
+        """Thread that monitors the log file and sends new entries to SIEM"""
+        last_sent_position = self._load_last_position()
+        self.logger.info(f"Starting SIEM sender thread from position: {last_sent_position}")
         
         while True:
             try:
+                # Check connection status first
+                connection_status = self._check_siem_connection()
+                
+                # If connected, try to process any queued logs
+                if connection_status:
+                    self._process_queue()
+                    
+                # Process new logs from the main log file
                 if os.path.exists(self.unified_log_file):
                     with open(self.unified_log_file, 'r') as f:
                         f.seek(last_sent_position)
                         new_lines = f.readlines()
                         
                         if new_lines:
+                            current_position = last_sent_position
                             for line in new_lines:
                                 if line.strip():
-                                    self._send_to_siem(line.strip())
+                                    line_position = current_position + len(line)
+                                    
+                                    # If connected, try to send directly
+                                    if self.siem_connected:
+                                        send_success = self._send_to_siem(line.strip())
+                                        if send_success:
+                                            last_sent_position = line_position
+                                        else:
+                                            # If send fails, add to queue and stop processing for now
+                                            self._add_to_queue(line.strip())
+                                            break
+                                    else:
+                                        # If disconnected, add to queue and continue to next line
+                                        self._add_to_queue(line.strip())
+                                        last_sent_position = line_position
+                                
+                                current_position += len(line)
                             
-                            last_sent_position = f.tell()
+                            # Save our position
+                            self._save_last_position(last_sent_position)
                 
-                time.sleep(5)
+                # Sleep before next check
+                # Use shorter sleep if we're connected, longer if not
+                sleep_time = 5 if self.siem_connected else self.connection_retry_interval
+                time.sleep(sleep_time)
                 
             except Exception as e:
                 self.logger.error(f"Error in SIEM sender thread: {e}")
                 time.sleep(10)
     
-    def _send_to_siem(self, log_entry: str) -> None:
+    def _send_to_siem(self, log_entry: str) -> bool:
+        """
+        Send a log entry to the configured SIEM server
+        
+        Returns:
+            bool: True if send was successful, False otherwise
+        """
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(5)
                 sock.connect((self.siem_config["ip_address"], int(self.siem_config["port"])))
                 sock.sendall((log_entry + "\n").encode('utf-8'))
                 self.logger.debug(f"Sent log to SIEM: {log_entry}")
+                return True
                 
         except Exception as e:
-            self.logger.error(f"Failed to send log to SIEM: {e}")
+            # Only log error if we think we're connected - prevents log flooding
+            if self.siem_connected:
+                self.logger.error(f"Failed to send log to SIEM: {e}")
+                
+            # Track connection state
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                if self.siem_connected:
+                    self.logger.warning(f"SIEM connection marked as down after {self.consecutive_failures} consecutive failures")
+                self.siem_connected = False
+                
+            return False
 
 def print_banner():
     """Print the honeypot banner"""
@@ -307,12 +496,22 @@ def print_service_menu(config):
 def main():
     global logger, running
 
+    # Handle 'help' manually BEFORE parsing arguments
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "help":
+        print("\nUsage:")
+        print("  python jebakan.py --help          Show this help message and exit")
+        print("  python jebakan.py --config-siem    Configure SIEM integration")
+        print("  python jebakan.py [options]        Start honeypot with selected options")
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(description="Python Honeypot System")
     parser.add_argument("-c", "--config", help="Path to configuration file", default="config/honeypot.json")
     parser.add_argument("-v", "--verbose", help="Increase output verbosity", action="store_true")
     parser.add_argument("-n", "--no-prompt", help="Start with default services (no interactive prompt)", action="store_true")
     parser.add_argument("--interaction", choices=["low", "medium", "high"],
                         help="Set global interaction level for all services")
+    parser.add_argument("--services", help="Comma-separated list of services to enable or 'all'", type=str)
+    parser.add_argument("--config-siem", action="store_true", help="Configure SIEM integration")
     args = parser.parse_args()
 
     print_banner()
@@ -859,58 +1058,54 @@ def main():
     ]
     service_choices = ', '.join(service_map)
 
-    # Parse command line arguments
+    # Handle 'help' manually BEFORE parsing arguments
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "help":
+        print("\nUsage:")
+        print("  python jebakan.py --help          Show this help message and exit")
+        print("  python jebakan.py --config-siem    Configure SIEM integration")
+        print("  python jebakan.py [options]        Start honeypot with selected options")
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(description="Python Honeypot System")
     parser.add_argument("-c", "--config", help="Path to configuration file", default="config/honeypot.json")
     parser.add_argument("-v", "--verbose", help="Increase output verbosity", action="store_true")
     parser.add_argument("-n", "--no-prompt", help="Start with default services (no interactive prompt)", action="store_true")
     parser.add_argument("--interaction", choices=["low", "medium", "high"],
                         help="Set global interaction level for all services")
-    parser.add_argument(
-        "--services",
-        help=f"Comma-separated list of services to enable or 'all'. Options: {service_choices}",
-        type=str
-    )
-    parser.add_argument("config-siem", nargs='?', help="Configure SIEM integration")
+    parser.add_argument("--services", help="Comma-separated list of services to enable or 'all'", type=str)
+    parser.add_argument("--config-siem", action="store_true", help="Configure SIEM integration")
     args = parser.parse_args()
 
+
     # Check for config-siem command
-    if len(sys.argv) > 1 and sys.argv[1] == "config-siem":
+    if args.config_siem:
         print("\n=== SIEM Configuration ===")
         ip_address = input("Enter SIEM server IP address: ").strip()
         port = input("Enter SIEM server port: ").strip()
-        
+
         try:
             socket.inet_aton(ip_address)
             port = int(port)
             if not (1 <= port <= 65535):
                 raise ValueError("Port must be between 1 and 65535")
-            
-            with open(args.config, 'r') as f:
-                config = json.load(f)
-            
-            # Create siem service at the same level as other services
-            if "services" not in config:
-                config["services"] = {}
-            
-            config["services"]["siem"] = {
+
+            # Load existing config
+            config = load_config(args.config)
+
+            # Write SIEM settings directly at root
+            config["siem-server"] = {
                 "enabled": True,
                 "ip_address": ip_address,
                 "port": port
             }
-            
-            with open(args.config, 'w') as f:
-                json.dump(config, f, indent=4)
-            
-            print("SIEM configuration saved successfully")
-            
-        except socket.error:
-            print("Invalid IP address format")
-        except ValueError as e:
-            print(f"Invalid port: {e}")
+
+            # Save updated config
+            save_config(config, args.config)
+            print("SIEM configuration saved successfully.")
+
         except Exception as e:
-            print(f"Error updating configuration: {e}")
-        
+            print(f"Error configuring SIEM: {e}")
+
         sys.exit(0)
 
     # Print banner
