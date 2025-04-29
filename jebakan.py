@@ -40,6 +40,7 @@ import argparse
 import signal
 import sys
 import re
+import geoip2.database
 from typing import Dict, Any, Tuple, Optional
 import colorama
 from colorama import Fore, Style, init
@@ -47,18 +48,8 @@ from colorama import Fore, Style, init
 # Initialize colorama for colored terminal output
 init(autoreset=True)
 
-# Import service modules
-#from services.ssh_service import SSHService
-#from services.http_service import HTTPService
-#from services.ftp_service import FTPService
-#from services.telnet_service import TelnetService
-#from services.mysql_service import MySQLService
-#from services.mssql_service import MSSQLService
-
 # Import utilities
 from utils.config_manager import load_config, save_config
-from utils.analytics import AnalyticsEngine
-from utils.alert_manager import AlertManager
 
 # Global variables
 running = True
@@ -163,7 +154,7 @@ def check_port_available(host, port):
             return False
 
 class UnifiedLogger:
-    """Unified logger for all honeypot activities with SIEM integration"""
+    """Unified logger for all honeypot activities with SIEM integration and geolocation"""
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -171,6 +162,7 @@ class UnifiedLogger:
         self.log_dir = config.get("logging", {}).get("dir", "logs/")
         self.unified_log_file = os.path.join(self.log_dir, "honeypot_attacks.json")
         self.siem_config = config.get("siem-server", None)
+        self.geoip_db_path = config.get("geoip_db_path", "GeoLite2-City.mmdb")
         
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
@@ -179,6 +171,15 @@ class UnifiedLogger:
             with open(self.unified_log_file, 'w') as f:
                 f.write("")
         
+        # Load GeoIP database if available
+        self.geoip_reader = None
+        if os.path.exists(self.geoip_db_path):
+            try:
+                self.geoip_reader = geoip2.database.Reader(self.geoip_db_path)
+                self.logger.info("GeoIP database loaded successfully.")
+            except Exception as e:
+                self.logger.error(f"Failed to load GeoIP database: {e}")
+
         if self.siem_config:
             self.siem_sender = threading.Thread(target=self._siem_sender_thread, daemon=True)
             self.siem_sender.start()
@@ -194,7 +195,21 @@ class UnifiedLogger:
             "command": command,
             "additional_data": additional_data or {}
         }
-        
+
+        # Add geolocation enrichment
+        if self.geoip_reader:
+            try:
+                response = self.geoip_reader.city(attacker_ip)
+                geo_info = {
+                    "country": response.country.name,
+                    "city": response.city.name,
+                    "asn": response.traits.autonomous_system_organization,
+                    "isp": response.traits.isp,
+                }
+                log_entry["geolocation"] = {k: v for k, v in geo_info.items() if v}
+            except Exception:
+                log_entry["geolocation"] = {}
+
         with open(self.unified_log_file, 'a') as f:
             f.write(json.dumps(log_entry) + "\n")
     
@@ -286,11 +301,8 @@ def print_service_menu(config):
         print(f"{i}. {service.upper()} (Port {port}) {status}")
 
     print(f"\n{Fore.YELLOW}Additional options:")
-    print(f"{Fore.CYAN}d. {Fore.WHITE}Enable dashboard")
-    print(f"{Fore.CYAN}a. {Fore.WHITE}Enable analytics")
-    print(f"{Fore.CYAN}q. {Fore.WHITE}Quit")
-    print(f"  S. Configure SIEM")
-    print(f"  Q. Quit\n")
+    print(f"{Fore.CYAN}S. {Fore.WHITE}Configure SIEM")
+    print(f"{Fore.CYAN}Q. {Fore.WHITE}Quit\n")
 
 def main():
     global logger, running
@@ -340,73 +352,46 @@ def main():
 
     if args.no_prompt:
         services_to_enable = [s for s, scfg in config["services"].items() if scfg.get("enabled")]
-        enable_dashboard = config["dashboard"]["enabled"]
-        enable_analytics = config["analytics"]["enabled"]
+
     else:
         result = select_services(config, args)
-        if not result:
+        if result is None:
             print(f"{Fore.YELLOW}Exiting...")
             return
-        services_to_enable, enable_dashboard, enable_analytics = result
+        services_to_enable = result
+
         print(f"[DEBUG] main(): Got services_to_enable: {services_to_enable}")
 
         save_config(config, args.config)
 
-    alert_manager = AlertManager(config)
-    analytics_engine = AnalyticsEngine(config) if enable_analytics else None
-
     started_services = start_services(config, services_to_enable, unified_logger)
 
-    if enable_analytics and analytics_engine:
-        analytics_thread = threading.Thread(target=analytics_engine.start)
-        analytics_thread.daemon = True
-        analytics_thread.start()
-        logger.info("Analytics engine started")
 
-    if enable_dashboard:
-        from utils.dashboard import DashboardServer
-        dashboard_port = config["dashboard"]["port"]
-        if check_port_available(config["network"]["bind_ip"], dashboard_port):
-            dashboard = DashboardServer(config, analytics_engine)
-            dashboard_thread = threading.Thread(target=dashboard.start)
-            dashboard_thread.daemon = True
-            dashboard_thread.start()
-            logger.info(f"Dashboard server started on port {dashboard_port}")
-        else:
-            print(f"{Fore.RED}Dashboard port {dashboard_port} is already in use. Dashboard will not be started.")
-            logger.error(f"Dashboard port {dashboard_port} is already in use.")
-    else:
-        dashboard_port = None
+def print_status(started_services):
+    """Print the status of started services"""
+    if not started_services:
+        print(f"\n{Fore.RED}No services were started.")
+        return
 
-    print_status(started_services, dashboard_port, enable_analytics)
-    logger.info(f"Honeypot started with {len(started_services)} service(s)")
+    print(f"\n{Fore.GREEN}=== Honeypot Status ===")
+    print(f"{Fore.CYAN}The following services are running:")
 
-    try:
-        while running:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        running = False
-        logger.info("Shutting down honeypot...")
-        cleanup_services(active_services)  # Add cleanup here too
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        cleanup_services(active_services)
-    finally:
-        cleanup_services(active_services)  # Add final cleanup
+    for service, port in started_services:
+        print(f"  {Fore.GREEN}✓ {service} on port {port}")
 
-    try:
-        while running:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        running = False
-        logger.info("Shutting down honeypot...")
+    print(f"\n{Fore.YELLOW}Press Ctrl+C to stop the honeypot.")
+    print(f"{Style.RESET_ALL}")
+
 
 def select_services(config, args):
     """Prompt user to select services to enable"""
     from utils.config_manager import save_config
+
     if "global_interaction_level" not in config:
         config["global_interaction_level"] = args.interaction or "high"
+
     print_service_menu(config)
+
     service_map = [
         "ssh", "http", "ftp", "telnet", "mysql", "mssql",
         "rdp", "vnc", "redis", "elasticsearch", "docker"
@@ -416,58 +401,55 @@ def select_services(config, args):
         "mysql": 3306, "mssql": 1433, "rdp": 3389, "vnc": 5900,
         "redis": 6379, "elasticsearch": 9200, "docker": 2375
     }
+
     while True:
         try:
             raw = input(f"\n{Fore.GREEN}Enter your selection: {Style.RESET_ALL}")
             cleaned = raw.strip().lower()
             print(f"[DEBUG] Raw input: {repr(raw)}")
+
             if cleaned == 'q':
-                return None, False, False
-            enable_dashboard = 'd' in cleaned
-            enable_analytics = 'a' in cleaned
-            
-            # Add SIEM configuration option
+                return None
+
             if cleaned == 's':
                 print(f"\n{Fore.CYAN}=== SIEM Configuration ==={Style.RESET_ALL}")
                 ip_address = input("Enter SIEM server IP address: ").strip()
                 port = input("Enter SIEM server port: ").strip()
-                
+
                 try:
                     socket.inet_aton(ip_address)
                     port = int(port)
                     if not (1 <= port <= 65535):
                         raise ValueError("Port must be between 1 and 65535")
-                    
-                    # Add SIEM configuration to services
+
                     if "services" not in config:
                         config["services"] = {}
-                    
+
                     config["services"]["siem"] = {
                         "enabled": True,
                         "ip_address": ip_address,
                         "port": port
                     }
-                    
-                    # Save configuration immediately
+
                     save_config(config, args.config)
                     print(f"{Fore.GREEN}SIEM configuration saved successfully{Style.RESET_ALL}")
-                    
+
                 except socket.error:
                     print(f"{Fore.RED}Invalid IP address format{Style.RESET_ALL}")
                 except ValueError as e:
                     print(f"{Fore.RED}Invalid port: {e}{Style.RESET_ALL}")
                 except Exception as e:
                     print(f"{Fore.RED}Error updating configuration: {e}{Style.RESET_ALL}")
-                
-                continue  # Return to menu after configuring SIEM
-            
-            # Do NOT remove 'a' or 'd' until AFTER checking 'all'
+
+                continue
+
             if cleaned == 'all':
                 cleaned = ','.join(str(i) for i in range(1, len(service_map) + 1))
                 print(f"[DEBUG] Interpreting 'all' as: {cleaned}")
-            # Now safely strip dashboard/analytics flags
-            cleaned = cleaned.replace('d', '').replace('a', '').replace(' ', '')
+
+            cleaned = cleaned.replace(' ', '')
             selected_services = []
+
             for part in cleaned.split(','):
                 if part.isdigit():
                     idx = int(part) - 1
@@ -475,8 +457,10 @@ def select_services(config, args):
                         selected_services.append(service_map[idx])
                 elif part in service_map:
                     selected_services.append(part)
+
             print(f"[DEBUG] Selected services: {selected_services}")
             services_to_enable = []
+
             for svc in selected_services:
                 config["services"].setdefault(svc, {
                     "port": default_ports[svc],
@@ -486,12 +470,15 @@ def select_services(config, args):
                 config["services"][svc]["enabled"] = True
                 config["services"][svc].setdefault("interaction_level", config["global_interaction_level"])
                 services_to_enable.append(svc)
-            if not services_to_enable and not enable_dashboard and not enable_analytics:
+
+            if not services_to_enable:
                 print(f"{Fore.RED}No valid services selected. Please try again.")
                 continue
+
             save_config(config, args.config)
             logger.info(f"Saved configuration to {args.config}")
-            return services_to_enable, enable_dashboard, enable_analytics
+            return services_to_enable
+
         except Exception as e:
             print(f"{Fore.RED}Error: {e}. Please try again.")
 
@@ -516,7 +503,8 @@ def start_services(config, services_to_enable, unified_logger=None):
                     ssh_service = SSHService(
                         host=config["network"]["bind_ip"],
                         port=config["services"]["ssh"]["port"],
-                        config=config
+                        config=config,
+                        unified_logger=unified_logger
                     )
                     ssh_thread = threading.Thread(target=ssh_service.start)
                     ssh_thread.daemon = True
@@ -544,7 +532,8 @@ def start_services(config, services_to_enable, unified_logger=None):
                     http_service = HTTPService(
                         host=config["network"]["bind_ip"],
                         port=config["services"]["http"]["port"],
-                        config=config
+                        config=config,
+                        unified_logger=unified_logger
                     )
                     http_thread = threading.Thread(target=http_service.start)
                     http_thread.daemon = True
@@ -572,7 +561,8 @@ def start_services(config, services_to_enable, unified_logger=None):
                     ftp_service = FTPService(
                         host=config["network"]["bind_ip"],
                         port=config["services"]["ftp"]["port"],
-                        config=config
+                        config=config,
+                        unified_logger=unified_logger
                     )
                     ftp_thread = threading.Thread(target=ftp_service.start)
                     ftp_thread.daemon = True
@@ -600,7 +590,8 @@ def start_services(config, services_to_enable, unified_logger=None):
                     telnet_service = TelnetService(
                         host=config["network"]["bind_ip"],
                         port=config["services"]["telnet"]["port"],
-                        config=config
+                        config=config,
+                        unified_logger=unified_logger
                     )
                     telnet_thread = threading.Thread(target=telnet_service.start)
                     telnet_thread.daemon = True
@@ -628,7 +619,8 @@ def start_services(config, services_to_enable, unified_logger=None):
                     mysql_service = MySQLService(
                         host=config["network"]["bind_ip"],
                         port=config["services"]["mysql"]["port"],
-                        config=config
+                        config=config,
+                        unified_logger=unified_logger
                     )
                     mysql_thread = threading.Thread(target=mysql_service.start)
                     mysql_thread.daemon = True
@@ -656,7 +648,8 @@ def start_services(config, services_to_enable, unified_logger=None):
                     mssql_service = MSSQLService(
                         host=config["network"]["bind_ip"],
                         port=config["services"]["mssql"]["port"],
-                        config=config
+                        config=config,
+                        unified_logger=unified_logger
                     )
                     mssql_thread = threading.Thread(target=mssql_service.start)
                     mssql_thread.daemon = True
@@ -684,7 +677,8 @@ def start_services(config, services_to_enable, unified_logger=None):
                     rdp_service = RDPService(
                         host=config["network"]["bind_ip"],
                         port=config["services"]["rdp"]["port"],
-                        config=config
+                        config=config,
+                        unified_logger=unified_logger
                     )
                     rdp_thread = threading.Thread(target=rdp_service.start)
                     rdp_thread.daemon = True
@@ -712,7 +706,8 @@ def start_services(config, services_to_enable, unified_logger=None):
                     vnc_service = VNCService(
                         host=config["network"]["bind_ip"],
                         port=config["services"]["vnc"]["port"],
-                        config=config
+                        config=config,
+                        unified_logger=unified_logger
                     )
                     vnc_thread = threading.Thread(target=vnc_service.start)
                     vnc_thread.daemon = True
@@ -740,7 +735,8 @@ def start_services(config, services_to_enable, unified_logger=None):
                     redis_service = RedisService(
                         host=config["network"]["bind_ip"],
                         port=config["services"]["redis"]["port"],
-                        config=config
+                        config=config,
+                        unified_logger=unified_logger
                     )
                     redis_thread = threading.Thread(target=redis_service.start)
                     redis_thread.daemon = True
@@ -768,7 +764,8 @@ def start_services(config, services_to_enable, unified_logger=None):
                     elasticsearch_service = ElasticsearchService(
                         host=config["network"]["bind_ip"],
                         port=config["services"]["elasticsearch"]["port"],
-                        config=config
+                        config=config,
+                        unified_logger=unified_logger
                     )
                     elasticsearch_thread = threading.Thread(target=elasticsearch_service.start)
                     elasticsearch_thread.daemon = True
@@ -796,7 +793,8 @@ def start_services(config, services_to_enable, unified_logger=None):
                     docker_service = DockerService(
                         host=config["network"]["bind_ip"],
                         port=config["services"]["docker"]["port"],
-                        config=config
+                        config=config,
+                        unified_logger=unified_logger
                     )
                     docker_thread = threading.Thread(target=docker_service.start)
                     docker_thread.daemon = True
@@ -968,49 +966,18 @@ def main():
             print(f"{Fore.YELLOW}Exiting...")
             return
 
-        services_to_enable, enable_dashboard, enable_analytics = result
-
-    # Initialize alert manager
-    alert_manager = AlertManager(config)
-
-    # Initialize analytics engine
-    analytics_engine = None
-    if enable_analytics:
-        analytics_engine = AnalyticsEngine(config)
+        services_to_enable = result
 
     # Start services (modify to pass unified_logger)
-    started_services = start_services(config, services_to_enable)
+    started_services = start_services(config, services_to_enable, unified_logger)
 
     # Save updated interaction level if set via CLI
     if args.interaction:
         save_config(config, args.config)
         logger.info(f"Saved global interaction level '{args.interaction}' to {args.config}")
 
-    # Start analytics engine if enabled
-    if enable_analytics and analytics_engine:
-        analytics_thread = threading.Thread(target=analytics_engine.start)
-        analytics_thread.daemon = True
-        analytics_thread.start()
-        logger.info("Analytics engine started")
-
-    # Start dashboard server if enabled
-    dashboard_port = None
-    if enable_dashboard:
-        from utils.dashboard import DashboardServer
-        dashboard_port = config["dashboard"]["port"]
-
-        if not check_port_available(config["network"]["bind_ip"], dashboard_port):
-            print(f"{Fore.RED}Dashboard port {dashboard_port} is already in use. Dashboard will not be started.")
-            logger.error(f"Dashboard port {dashboard_port} is already in use.")
-        else:
-            dashboard = DashboardServer(config, analytics_engine)
-            dashboard_thread = threading.Thread(target=dashboard.start)
-            dashboard_thread.daemon = True
-            dashboard_thread.start()
-            logger.info(f"Dashboard server started on port {dashboard_port}")
-
     # Print status
-    print_status(started_services, dashboard_port if enable_dashboard else None, enable_analytics)
+    print_status(started_services)
     logger.info(f"Honeypot started with {len(started_services)} service(s)")
 
     # Keep the main thread alive
