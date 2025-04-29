@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SSH service emulator for the honeypot system
+FTP service emulator for the honeypot system
 """
 
 import socket
@@ -11,469 +11,450 @@ import json
 import os
 import time
 import re
-import paramiko
-import sys
 from typing import Dict, List, Any, Tuple, Optional
 
 from services.base_service import BaseService
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)  # <-- ensures console output
-    ]
-)
-
-class SSHService(BaseService):
-    """SSH service emulator for the honeypot"""
+class FTPService(BaseService):
+    """FTP service emulator for the honeypot"""
     
     def __init__(self, host: str, port: int, config: Dict[str, Any], unified_logger=None):
-        super().__init__(host, port, config, "ssh")
-        self.unified_logger = unified_logger
-        
-        # Generate SSH server key if needed
-        self.key_file = os.path.join("data", "ssh_host_rsa_key")
-        self._ensure_server_key()
-        
-        # Set banner if specified
-        if "banner" in self.service_config:
-            self.banner = self.service_config["banner"]
-        else:
-            self.banner = "SSH-2.0-OpenSSH_7.4p1 Ubuntu-10"
-            
-        # Track command history by session
-        self.command_history = {}
-
-    def _ensure_server_key(self) -> None:
-        """Ensure SSH server key exists, generate if it doesn't"""
-        os.makedirs(os.path.dirname(self.key_file), exist_ok=True)
-        
-        if not os.path.exists(self.key_file):
-            if self.unified_logger:
-                self.unified_logger.log_attack(
-                    service="ssh",
-                    attacker_ip="system",
-                    attacker_port=0,
-                    command="system_event",
-                    additional_data={"message": "Generating SSH host key"}
-                )
-            self.logger.info("Generating SSH host key...")
-            key = paramiko.RSAKey.generate(2048)
-            key.write_private_key_file(self.key_file)
-            self.logger.info(f"SSH host key generated and saved to {self.key_file}")
-    
-    def start(self) -> None:
-        """Start the SSH service properly by listening on a socket"""
-        try:
-            self.sock.bind((self.host, self.port))
-            self.sock.listen(5)
-            self.running = True
-            
-            if self.unified_logger:
-                self.unified_logger.log_attack(
-                    service="ssh",
-                    attacker_ip="system",
-                    attacker_port=0,
-                    command="service_start",
-                    additional_data={"port": self.port}
-                )
-            
-            self.logger.info(f"SSH honeypot started on port {self.port}")
-            
-            while self.running:
-                try:
-                    client, addr = self.sock.accept()
-                    
-                    # Log connection attempt
-                    if self.unified_logger:
-                        self.unified_logger.log_attack(
-                            service="ssh",
-                            attacker_ip=addr[0],
-                            attacker_port=addr[1],
-                            command="connection_attempt",
-                            additional_data={"timestamp": datetime.datetime.now().isoformat()}
-                        )
-                    
-                    # Set a timeout for the client socket
-                    client.settimeout(self.config["resource_limits"]["connection_timeout"])
-                    
-                    # Check if we've reached the maximum connections
-                    if self.connection_count >= self.config["network"]["max_connections"]:
-                        self.logger.warning(f"Maximum connections reached, dropping connection from {addr[0]}")
-                        client.close()
-                        continue
-                    
-                    # Increment connection counters
-                    self.connection_count += 1
-                    self._increment_ip_counter(addr[0])
-                    
-                    # Log the connection
-                    self.logger.info(f"Connection from {addr[0]}:{addr[1]} to SSH service")
-                    
-                    # Start a new thread to handle the client
-                    client_handler = threading.Thread(
-                        target=self._handle_client_wrapper,
-                        args=(client, addr)
-                    )
-                    client_handler.daemon = True
-                    client_handler.start()
-                    
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    if self.unified_logger:
-                        self.unified_logger.log_attack(
-                            service="ssh",
-                            attacker_ip="error",
-                            attacker_port=0,
-                            command="error",
-                            additional_data={"error": str(e)}
-                        )
-                    self.logger.error(f"Error accepting connection: {e}")
-                    
-        except Exception as e:
-            if self.unified_logger:
-                self.unified_logger.log_attack(
-                    service="ssh",
-                    attacker_ip="error",
-                    attacker_port=0,
-                    command="service_error",
-                    additional_data={"error": str(e)}
-                )
-            self.logger.error(f"Error starting SSH service: {e}")
-        finally:
-            if self.sock:
-                self.sock.close()
-
-    def handle_client(self, client_socket: socket.socket, address: Tuple[str, int],
-                      connection_data: Dict[str, Any]) -> None:
         """
-        Handle an SSH client connection
+        Initialize the FTP service
         
         Args:
-            client_socket: Client socket object
-            address: Client address tuple (ip, port)
-            connection_data: Dictionary to store connection data for logging
+            host: Host IP to bind to
+            port: Port to listen on
+            config: Global configuration dictionary
+            unified_logger: Unified logging system
+        """
+        super().__init__(host, port, config, "ftp")
+        self.unified_logger = unified_logger
+        
+        # Verify that credentials were loaded
+        self.logger.debug(f"FTP Service initialized. Path to config: {config.get('config_path', 'Unknown')}")
+        self.logger.debug(f"Available credentials: {self.credentials}")
+        self.logger.debug(f"Service config: {self.service_config}")
+
+        # Set up FTP server banner as an instance attribute
+        self.banner = self.service_config.get("banner", "220 FTP Server Ready")
+        
+        # Create fake filesystem structure
+        self.ftproot = os.path.join("data", "ftp")
+        os.makedirs(self.ftproot, exist_ok=True)
+        
+        # Ensure some default files exist
+        self._ensure_default_files()
+        
+        # Track active FTP sessions
+        self.sessions = {}
+    
+    def _ensure_default_files(self) -> None:
+        """Ensure default FTP files exist"""
+        # Create a README file
+        readme_path = os.path.join(self.ftproot, "README.txt")
+        if not os.path.exists(readme_path):
+            with open(readme_path, "w") as f:
+                f.write("This is the FTP server root directory.\n")
+        
+        # Create a sample data directory
+        data_dir = os.path.join(self.ftproot, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        
+        # Create a sample file in the data directory
+        sample_path = os.path.join(data_dir, "sample.txt")
+        if not os.path.exists(sample_path):
+            with open(sample_path, "w") as f:
+                f.write("This is a sample file in the data directory.\n")
+        
+        # Create an upload directory
+        upload_dir = os.path.join(self.ftproot, "upload")
+        os.makedirs(upload_dir, exist_ok=True)
+        
+        # Create a private directory
+        private_dir = os.path.join(self.ftproot, "private")
+        os.makedirs(private_dir, exist_ok=True)
+        
+        # Create a configuration file with fake sensitive data
+        if self.config["deception"]["breadcrumbs"]:
+            config_path = os.path.join(private_dir, "config.ini")
+            if not os.path.exists(config_path):
+                with open(config_path, "w") as f:
+                    f.write("""[database]
+host = 192.168.1.10
+port = 3306
+user = dbadmin
+password = Str0ngP@$$w0rd
+database = production
+
+[api]
+key = f8a7c6b5e4d3c2b1a0
+secret = 9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2
+
+[server]
+hostname = web-prod-01
+environment = production
+""")
+    
+    def handle_client(self, client_socket: socket.socket, address: Tuple[str, int],
+                    connection_data: Dict[str, Any]) -> None:
+        """
+        Handle a client connection to the FTP service
         """
         session_id = f"{address[0]}:{address[1]}:{time.time()}"
-        self.command_history[session_id] = []
+        self.sessions[session_id] = {
+            "authenticated": False,
+            "username": None,
+            "current_dir": "/",
+            "binary_mode": False,
+            "passive_mode": False,
+            "data_port": None,
+            "data_ip": None,
+            "commands": [],
+            "data_sock": None  # explicitly track the passive socket
+        }
     
-        # Create the transport first
-        transport = paramiko.Transport(client_socket)
-        
-        # Then set the banner
-        try:
-            transport.local_version = self.banner
-        except Exception as e:
-            self.logger.error(f"Error setting banner: {e}")
-            if self.unified_logger:
-                self.unified_logger.log_attack(
-                    service="ssh",
-                    attacker_ip=address[0],
-                    attacker_port=address[1],
-                    command="error",
-                    additional_data={"error": f"Banner set error: {str(e)}"}
-                )
-            return
-        
-        transport.add_server_key(paramiko.RSAKey(filename=self.key_file))
-        server_interface = CustomSSHServerInterface(self)
+        self._send_response(client_socket, self.banner)
     
         try:
-            self.logger.info(f"[{address}] Starting SSH session")
-            transport.start_server(server=server_interface)
-    
-            chan = transport.accept(10)
-            if chan is None:
-                self.logger.error(f"[{address}] No channel opened")
-                return
-    
-            self.logger.info(f"[{address}] Channel accepted")
-    
-            if not server_interface.event.wait(5):
-                self.logger.error(f"[{address}] Shell not requested in time")
-                chan.close()
-                return
-    
-            if not chan.send_ready():
-                self.logger.warning(f"[{address}] Channel not ready for send()")
-                chan.close()
-                return
-    
-            chan.settimeout(15.0)
-            hostname = self.config["deception"]["system_info"]["hostname"]
-            username = server_interface.username or "user"
-    
-            # Log the authentication to unified logger
-            if self.unified_logger:
-                self.unified_logger.log_attack(
-                    service="ssh",
-                    attacker_ip=address[0],
-                    attacker_port=address[1],
-                    command="login_success",
-                    additional_data={
-                        "username": server_interface.username,
-                        "password": server_interface.password if hasattr(server_interface, "password") else "unknown",
-                        "session_id": session_id
-                    }
-                )
-    
-            chan.send(b"DEBUG: shell started\r\n")
-            chan.send(f"Welcome to Ubuntu 18.04.5 LTS ({hostname})\r\n".encode())
-            chan.send(f"{username}@{hostname}:~$ ".encode())
-    
-            buffer = ''
-    
             while True:
-                try:
-                    data = chan.recv(1024)
-                    if not data:
-                        self.logger.info(f"[{address}] Channel closed")
-                        break
-    
-                    decoded = data.decode('utf-8', errors='ignore')
-                    self.logger.info(f"[{address}] RAW input: {repr(decoded)}")
-                    buffer += decoded
-                    chan.send(decoded.encode())  # echo each character back as typed
-    
-                    if '\n' in buffer or '\r' in buffer:
-                        command = buffer.strip().replace('\r', '').replace('\n', '')
-                        buffer = ''
-    
-                        if not command:
-                            chan.send(f"{username}@{hostname}:~$ ".encode())
-                            continue
-    
-                        self.logger.info(f"[{address}] Command received: {command}")
-                        
-                        # Log command to unified logger
-                        if self.unified_logger:
-                            self.unified_logger.log_attack(
-                                service="ssh",
-                                attacker_ip=address[0],
-                                attacker_port=address[1],
-                                command=command,
-                                additional_data={
-                                    "session_id": session_id,
-                                    "timestamp": datetime.datetime.now().isoformat()
-                                }
-                            )
-                        
-                        self.command_history[session_id].append({
-                            "command": command,
-                            "timestamp": datetime.datetime.now().isoformat()
-                        })
-    
-                        if command.lower() in ['exit', 'logout', 'quit']:
-                            chan.send(b"logout\r\n")
-                            break
-    
-                        chan.send((command + '\r\n').encode())
-                        response = self.simulate_command_response(command, address=address)
-                        if not response.endswith('\n'):
-                            response += '\r\n'
-                        chan.send(response.encode())
-                        chan.send(f"{username}@{hostname}:~$ ".encode())
-    
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    self.logger.error(f"[{address}] Error: {e}")
-                    if self.unified_logger:
-                        self.unified_logger.log_attack(
-                            service="ssh",
-                            attacker_ip=address[0],
-                            attacker_port=address[1],
-                            command="error",
-                            additional_data={"error": str(e)}
-                        )
+                cmd_line = client_socket.recv(1024).decode('utf-8', errors='ignore').strip()
+                if not cmd_line:
                     break
     
-        except Exception as e:
-            self.logger.error(f"[{address}] SSH session error: {e}")
-            if self.unified_logger:
-                self.unified_logger.log_attack(
-                    service="ssh",
-                    attacker_ip=address[0],
-                    attacker_port=address[1],
-                    command="session_error",
-                    additional_data={"error": str(e)}
-                )
-            connection_data["error"] = str(e)
-        finally:
-            try:
-                if 'chan' in locals() and chan:
-                    chan.close()
-                transport.close()
-                client_socket.close()
-            except Exception:
-                pass
-            connection_data["data"]["command_history"] = self.command_history.pop(session_id, [])
-    
-    def simulate_command_response(self, command: str, context: Dict[str, Any] = None, address: Tuple[str, int] = None) -> str:
-            """
-            Simulate a response to an SSH command
-            """
-            interaction_level = self.service_config.get("interaction_level", "medium")
-            hostname = self.config["deception"]["system_info"]["hostname"]
-    
-            if command.startswith("cd "):
-                return ""
-    
-            elif command == "pwd":
-                return "/home/user\r\n"
-    
-            elif command == "whoami":
-                return "user\r\n"
-    
-            elif command == "id":
-                return "uid=1000(user) gid=1000(user) groups=1000(user)\r\n"
-    
-            elif command == "uname -a":
-                return f"Linux {hostname} {self.config['deception']['system_info']['kernel']} GNU/Linux\r\n"
-    
-            elif command == "hostname":
-                return f"{hostname}\r\n"
-    
-            elif command.startswith("ls"):
-                if " /etc" in command:
-                    return "apache2  cron.d  hosts  motd  passwd  shadow  ssh\r\n"
-                elif " /var" in command:
-                    return "backups  cache  lib  log  mail  spool  www\r\n"
+                if " " in cmd_line:
+                    cmd, arg = cmd_line.split(" ", 1)
                 else:
-                    return ".bash_history  .bashrc  .profile  .ssh  documents  secret.txt\r\n"
+                    cmd, arg = cmd_line, ""
     
-            elif command == "cat secret.txt":
-                if interaction_level == "high":
-                    if self.config["deception"]["breadcrumbs"]:
-                        # Log sensitive file access to unified logger
-                        if self.unified_logger and address:
-                            self.unified_logger.log_attack(
-                                service="ssh",
-                                attacker_ip=address[0],
-                                attacker_port=address[1],
-                                command="sensitive_file_access",
-                                additional_data={
-                                    "file": "secret.txt",
-                                    "timestamp": datetime.datetime.now().isoformat()
-                                }
-                            )
-                        return (
-                            "Database credentials:\r\n"
-                            "User: dbadmin\r\n"
-                            "Password: Str0ngP@$w0rd\r\n"
-                            "Server: 192.168.1.10\r\n"
-                        )
-                    else:
-                        return "Permission denied\r\n"
-                else:
-                    return "Permission denied\r\n"
+                cmd = cmd.upper()
     
-            elif command.startswith("ps"):
-                return (
-                    " PID TTY          TIME CMD\r\n"
-                    " 1234 pts/0    00:00:00 bash\r\n"
-                    " 5678 pts/0    00:00:00 ps\r\n"
-                )
+                session = self.sessions[session_id]
+                current_dir = session["current_dir"]
     
-            elif command.startswith("netstat") or command.startswith("ss"):
-                return (
-                    "tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN\r\n"
-                    "tcp        0      0 0.0.0.0:80              0.0.0.0:*               LISTEN\r\n"
-                    "tcp        0      0 127.0.0.1:3306          0.0.0.0:*               LISTEN\r\n"
-                )
+                # Record the command in connection data if available
+                if "data" in connection_data:
+                    connection_data["data"].setdefault("commands", []).append({
+                        "timestamp": datetime.datetime.now().isoformat(),
+                        "command": cmd_line
+                    })
     
-            elif command.startswith("ifconfig") or command.startswith("ip a"):
-                return (
-                    "eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\r\n"
-                    "        inet 192.168.1.100  netmask 255.255.255.0  broadcast 192.168.1.255\r\n"
-                )
-    
-            elif command.startswith("wget") or command.startswith("curl"):
-                if any(x in command for x in [".sh", ".pl", ".py", ".bin", ".elf", ".malware"]):
-                    self.logger.warning(f"Possible malware download attempt: {command}")
+                if cmd == "USER":
+                    session["username"] = arg
+                    self._send_response(client_socket, "331 User name okay, need password.")
+                elif cmd == "PASS":
+                    username = session["username"]
+                    password = arg
                     
-                    # Log malware download attempt to unified logger
-                    if self.unified_logger and address:
+                    # Log the authentication attempt
+                    auth_data = {
+                        "username": username,
+                        "password": password,
+                        "timestamp": datetime.datetime.now().isoformat()
+                    }
+                    
+                    # Add to connection data if available
+                    if "data" in connection_data:
+                        connection_data["data"].setdefault("auth_attempts", []).append(auth_data)
+                    
+                    self.logger.info(f"FTP authentication attempt from {address[0]} with username '{username}' and password '{password}'")
+                    
+                    # Log the authentication attempt to the unified logger
+                    if self.unified_logger:
                         self.unified_logger.log_attack(
-                            service="ssh",
+                            service="ftp",
                             attacker_ip=address[0],
                             attacker_port=address[1],
-                            command="malware_download_attempt",
-                            additional_data={
-                                "url": command.split()[-1] if len(command.split()) > 1 else "unknown",
-                                "timestamp": datetime.datetime.now().isoformat()
-                            }
+                            command="login_attempt",
+                            additional_data=auth_data
                         )
-                        
-                return "Connecting...\r\nHTTP request sent, awaiting response... 404 Not Found\r\n"
+                    
+                    if self.is_valid_credentials(username, password):
+                        session["authenticated"] = True
+                        self._send_response(client_socket, "230 User logged in, proceed.")
+                    else:
+                        self._send_response(client_socket, "530 Login incorrect.")
+                elif not session["authenticated"]:
+                    self._send_response(client_socket, "530 Not logged in.")
+                elif cmd == "PWD":
+                    self._send_response(client_socket, f'257 "{current_dir}" is the current directory.')
+                elif cmd == "CWD":
+                    new_dir = self._clean_path(arg, current_dir)
+                    session["current_dir"] = new_dir
+                    self._send_response(client_socket, f'250 Directory changed to {new_dir}')
+                elif cmd == "TYPE":
+                    if arg.upper() == "I":
+                        session["binary_mode"] = True
+                        self._send_response(client_socket, "200 Type set to I.")
+                    else:
+                        session["binary_mode"] = False
+                        self._send_response(client_socket, "200 Type set to A.")
+                elif cmd == "PASV":
+                    # Open passive socket
+                    psock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    psock.bind((self.host, 0))
+                    psock.listen(1)
+                    _, data_port = psock.getsockname()
     
-            elif "passwd" in command:
-                return "Changing password for user.\r\nCurrent password: \r\n"
+                    # Fix passive IP response
+                    real_host = self.config.get("public_ip", self.host)
+                    if real_host == "0.0.0.0":
+                        real_host = "127.0.0.1"
     
-            elif command.startswith("sudo"):
-                return "[sudo] password for user: Sorry, try again.\r\n"
+                    ip_parts = real_host.split(".")
+                    p1, p2 = data_port // 256, data_port % 256
+                    self._send_response(client_socket, f"227 Entering Passive Mode ({','.join(ip_parts)},{p1},{p2}).")
     
-            return f"Command not found: {command}\r\n"
+                    # Accept data connection in background
+                    def wait_for_data_conn():
+                        try:
+                            psock.settimeout(10)
+                            dsock, _ = psock.accept()
+                            session["data_sock"] = dsock
+                        except Exception as e:
+                            self.logger.warning(f"Passive mode connection failed: {e}")
+                        finally:
+                            psock.close()
+    
+                    threading.Thread(target=wait_for_data_conn, daemon=True).start()
+    
+                elif cmd == "LIST":
+                    # Log the LIST command to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="ftp",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command=f"LIST {arg}"
+                        )
+                    
+                    self._send_response(client_socket, "150 Here comes the directory listing.")
+                    time.sleep(1)
+                    if session["data_sock"]:
+                        listing = self._get_directory_listing(current_dir)
+                        try:
+                            session["data_sock"].sendall(listing.encode())
+                            session["data_sock"].close()
+                            session["data_sock"] = None
+                            self._send_response(client_socket, "226 Directory send OK.")
+                        except Exception as e:
+                            self.logger.error(f"LIST failed: {e}")
+                            self._send_response(client_socket, "426 Data connection error.")
+                    else:
+                        self._send_response(client_socket, "425 Can't open data connection.")
+    
+                elif cmd == "RETR":
+                    # Log the file retrieval attempt to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="ftp",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command=f"RETR {arg}"
+                        )
+                    
+                    file_path = os.path.join(self.ftproot, current_dir.strip("/"), arg)
+                    if os.path.isfile(file_path) and session["data_sock"]:
+                        self._send_response(client_socket, f"150 Opening binary mode data connection for {arg}")
+                        try:
+                            with open(file_path, "rb") as f:
+                                data = f.read()
+                            session["data_sock"].sendall(data)
+                            session["data_sock"].close()
+                            session["data_sock"] = None
+                            self._send_response(client_socket, "226 Transfer complete.")
+                            self.logger.info(f"File {arg} sent to {session['username']} at {address[0]}")
+                        except Exception as e:
+                            self.logger.error(f"Error sending file: {e}")
+                            self._send_response(client_socket, "451 Requested action aborted. Local error.")
+                    else:
+                        self._send_response(client_socket, "550 File not found or no data connection.")
+    
+                elif cmd == "STOR":
+                    # Log the file upload attempt to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="ftp",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command=f"STOR {arg}"
+                        )
+                    
+                    upload_path = os.path.join(self.ftproot, "upload", arg)
+                    if session["data_sock"]:
+                        self._send_response(client_socket, f"150 Ok to send data for {arg}")
+                        try:
+                            with open(upload_path, "wb") as f:
+                                while True:
+                                    chunk = session["data_sock"].recv(4096)
+                                    if not chunk:
+                                        break
+                                    f.write(chunk)
+                            session["data_sock"].close()
+                            session["data_sock"] = None
+                            self._send_response(client_socket, "226 Transfer complete.")
+                            self.logger.info(f"File {arg} uploaded from {address[0]}")
+                        except Exception as e:
+                            self.logger.error(f"Error saving file: {e}")
+                            self._send_response(client_socket, "451 Transfer aborted due to error.")
+                    else:
+                        self._send_response(client_socket, "425 Can't open data connection.")
+    
+                elif cmd == "QUIT":
+                    self._send_response(client_socket, "221 Goodbye.")
+                    break
+                else:
+                    # Log other commands to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="ftp",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command=cmd_line
+                        )
+                    self._send_response(client_socket, "502 Command not implemented.")
+        except Exception as e:
+            self.logger.error(f"FTP session error: {e}")
+        finally:
+            if session_id in self.sessions:
+                if self.sessions[session_id].get("data_sock"):
+                    try:
+                        self.sessions[session_id]["data_sock"].close()
+                    except:
+                        pass
+                del self.sessions[session_id]
 
     def is_valid_credentials(self, username: str, password: str) -> bool:
         """
-        Check if username/password combination is valid based on the configuration
-    
+        Check if credentials are valid for FTP login by reading from config
+        
         Args:
-            username: Username to check
-            password: Password to check
-    
+            username: Username
+            password: Password
+            
         Returns:
             True if credentials are valid, False otherwise
         """
-        # Get credentials from the configuration
-        valid_credentials = self.service_config.get("credentials", [])
+        # Log to debug what credentials we're checking
+        self.logger.debug(f"Validating credentials for user: {username}")
         
-        # Check if the credentials match any in the configuration
-        for cred in valid_credentials:
+        # Print the loaded credentials for debugging
+        self.logger.debug(f"Loaded credentials: {self.credentials}")
+        
+        # Use the credentials loaded from the configuration
+        for cred in self.credentials:
             if cred.get("username") == username and cred.get("password") == password:
+                self.logger.info(f"Valid credentials match for {username}")
                 return True
         
+        self.logger.info(f"No valid credential match for {username}")
         return False
 
-class CustomSSHServerInterface(paramiko.ServerInterface):
-    def __init__(self, service: SSHService):
-        self.event = threading.Event()
-        self.service = service
-        self.username = ""
-        self.password = ""
-
-    def check_auth_password(self, username, password):
-        self.username = username
-        self.password = password
+    def _send_response(self, client_socket: socket.socket, response: str) -> None:
+        """
+        Send an FTP response to the client
         
-        # Log authentication attempt to unified logger
-        if self.service.unified_logger:
-            self.service.unified_logger.log_attack(
-                service="ssh",
-                attacker_ip="unknown",  # We don't have access to the IP here directly
-                attacker_port=0,
-                command="login_attempt",
-                additional_data={
-                    "username": username,
-                    "password": password,
-                    "success": self.service.is_valid_credentials(username, password)
-                }
-            )
+        Args:
+            client_socket: Client socket object
+            response: Response string
+        """
+        try:
+            client_socket.send(f"{response}\r\n".encode())
+        except Exception as e:
+            self.logger.error(f"Error sending FTP response: {e}")
+    
+    def _handle_passive_connection(self, data_sock: socket.socket, session_id: str) -> None:
+        """
+        Handle a passive data connection
+        
+        Args:
+            data_sock: Data socket object
+            session_id: Session ID
+        """
+        try:
+            # Wait for client to connect (with timeout)
+            data_sock.settimeout(30)
+            client_sock, addr = data_sock.accept()
             
-        return paramiko.AUTH_SUCCESSFUL if self.service.is_valid_credentials(username, password) else paramiko.AUTH_FAILED
-
-    def get_allowed_auths(self, username):
-        return 'password'
-
-    def check_channel_request(self, kind, chanid):
-        return paramiko.OPEN_SUCCEEDED if kind == 'session' else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
-
-    def check_channel_pty_request(self, channel, term, width, height, pixelwidth, pixelheight, modes):
-        return True
-
-    def check_channel_shell_request(self, channel):
-        self.event.set()
-        return True
+            # Store the data socket in the session
+            self.sessions[session_id]["data_sock"] = client_sock
+            
+        except socket.timeout:
+            self.logger.warning(f"Timeout waiting for data connection for session {session_id}")
+        except Exception as e:
+            self.logger.error(f"Error handling passive connection: {e}")
+        finally:
+            # Close the server socket
+            data_sock.close()
+    
+    def _clean_path(self, path: str, current_dir: str) -> str:
+        """
+        Clean and normalize a path
+        
+        Args:
+            path: Path to clean
+            current_dir: Current directory
+            
+        Returns:
+            Cleaned path
+        """
+        # Handle absolute paths
+        if path.startswith("/"):
+            new_path = path
+        else:
+            # Handle relative paths
+            if current_dir.endswith("/"):
+                new_path = current_dir + path
+            else:
+                new_path = current_dir + "/" + path
+        
+        # Normalize path
+        parts = []
+        for part in new_path.split("/"):
+            if part == "..":
+                if parts:
+                    parts.pop()
+            elif part and part != ".":
+                parts.append(part)
+        
+        # Rebuild path
+        clean_path = "/" + "/".join(parts)
+        if not clean_path:
+            clean_path = "/"
+            
+        return clean_path
+    
+    def _get_directory_listing(self, path: str) -> str:
+        """
+        Get a simulated directory listing
+        
+        Args:
+            path: Directory path
+            
+        Returns:
+            Directory listing string
+        """
+        # Build a fake directory listing based on path
+        listing = ""
+        
+        if path == "/" or path == "":
+            listing += "-rw-r--r--  1 ftp  ftp     145 Apr 07 14:23 README.txt\r\n"
+            listing += "drwxr-xr-x  2 ftp  ftp    4096 Apr 07 14:23 data\r\n"
+            listing += "drwxr-xr-x  2 ftp  ftp    4096 Apr 07 14:23 upload\r\n"
+            listing += "drwx------  2 ftp  ftp    4096 Apr 07 14:23 private\r\n"
+        elif path == "/data":
+            listing += "-rw-r--r--  1 ftp  ftp     256 Apr 07 14:23 sample.txt\r\n"
+            listing += "-rw-r--r--  1 ftp  ftp    1024 Apr 07 14:23 data.csv\r\n"
+        elif path == "/private":
+            # Only show contents if breadcrumbs are enabled
+            if self.config["deception"]["breadcrumbs"]:
+                listing += "-rw-------  1 ftp  ftp     512 Apr 07 14:23 config.ini\r\n"
+            # Otherwise, return empty directory
+        elif path == "/upload":
+            # Empty directory
+            pass
+        else:
+            # Directory not found
+            pass
+        
+        return listing
