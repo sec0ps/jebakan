@@ -28,6 +28,9 @@
 #
 # =============================================================================
 #!/usr/bin/env python3
+"""
+Microsoft SQL Server (MSSQL) service emulator for the honeypot system
+"""
 
 import socket
 import threading
@@ -36,1152 +39,818 @@ import datetime
 import json
 import os
 import time
-import argparse
-import signal
-import sys
-import re
-import geoip2.database
-from typing import Dict, Any, Tuple, Optional
-import colorama
-from colorama import Fore, Style, init
-from utils.config_manager import load_config, save_config
+import struct
+import hashlib
+import random
+from typing import Dict, List, Any, Tuple, Optional
+from services.base_service import BaseService
 
-# Initialize colorama for colored terminal output
-init(autoreset=True)
+class MSSQLService(BaseService):
+    """Microsoft SQL Server service emulator for the honeypot"""
 
-running = True
-active_services = []
-logger = None
-
-# Define the base directory as the directory containing jebakan.py
-base_dir = os.path.dirname(os.path.abspath(__file__))
-
-# Now you can use this base_dir to construct paths to other files and directories
-config_path = os.path.join(base_dir, "honeypot.json")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-
-def setup_logging(config):
-    """Set up logging based on configuration"""
-    if not os.path.exists(config["logging"]["dir"]):
-        os.makedirs(config["logging"]["dir"])
-
-    logging.basicConfig(
-        filename=f"{config['logging']['dir']}/honeypot_{datetime.datetime.now().strftime('%Y%m%d')}.log",
-        level=getattr(logging, config["logging"]["level"]),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-
-    # Add console handler if enabled
-    if config["logging"]["console"]:
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(getattr(logging, config["logging"]["level"]))
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        console_handler.setFormatter(formatter)
-        logging.getLogger().addHandler(console_handler)
-
-    return logging.getLogger("honeypot")
-
-def signal_handler(sig, frame):
-    """Handle interrupt signals gracefully"""
-    global running, active_services, logger
-    
-    print("\nShutting down honeypot services...")
-    running = False
-    
-    # Clean up services before exit
-    cleanup_services(active_services)
-    
-    sys.exit(0)
-
-def cleanup_services(active_services):
-    """
-    Clean up all running services and release ports
-    
-    Args:
-        active_services: List of tuples containing (service_name, service_object, thread)
-    """
-    global logger
-    
-    print(f"{Fore.YELLOW}Cleaning up services and releasing ports...{Style.RESET_ALL}")
-    
-    for service_name, service_obj, thread in active_services:
-        try:
-            # Stop the service if it has a stop method
-            if hasattr(service_obj, 'stop'):
-                service_obj.stop()
-                logger.info(f"Stopped {service_name} service")
-            
-            # Ensure socket is closed
-            if hasattr(service_obj, 'sock'):
-                try:
-                    service_obj.sock.shutdown(socket.SHUT_RDWR)
-                except:
-                    pass
-                try:
-                    service_obj.sock.close()
-                    logger.info(f"Closed socket for {service_name}")
-                except:
-                    pass
-            
-            # Set running flag to False if exists
-            if hasattr(service_obj, 'running'):
-                service_obj.running = False
-        except Exception as e:
-            logger.error(f"Error cleaning up {service_name}: {e}")
-    
-    # Give threads a moment to clean up
-    time.sleep(1)
-    
-    # Force kill any remaining threads
-    for service_name, service_obj, thread in active_services:
-        if thread.is_alive():
-            logger.warning(f"Force stopping thread for {service_name}")
-            
-    print(f"{Fore.GREEN}Services cleaned up successfully{Style.RESET_ALL}")
-
-def check_port_available(host, port):
-    """Check if a port is available on the host"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind((host, port))
-            s.close()
-            return True
-        except OSError:
-            return False
-
-class UnifiedLogger:
-    """Unified logger for all honeypot activities with SIEM integration and geolocation"""
-    
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.logger = logging.getLogger("unified_logger")
-        self.log_dir = config.get("logging", {}).get("dir", "logs/")
-        self.unified_log_file = os.path.join(self.log_dir, "honeypot_attacks.json")
-        self.siem_config = config.get("siem-server", None)
-        self.geoip_db_path = config.get("geoip_db_path", "GeoLite2-City.mmdb")
-        self.siem_position_file = os.path.join(self.log_dir, "siem_last_position.txt")
-        self.siem_queue_file = os.path.join(self.log_dir, "siem_queue.json")
-        
-        # SIEM connection state
-        self.siem_connected = False
-        self.last_connection_attempt = 0
-        self.connection_retry_interval = 30  # seconds
-        self.consecutive_failures = 0
-        self.max_consecutive_failures = 3  # After this many failures, we'll mark as disconnected
-        
-        if not os.path.exists(self.log_dir):
-            os.makedirs(self.log_dir)
-        
-        if not os.path.exists(self.unified_log_file):
-            with open(self.unified_log_file, 'w') as f:
-                f.write("")
-                
-        # Initialize queue file if it doesn't exist
-        if not os.path.exists(self.siem_queue_file):
-            with open(self.siem_queue_file, 'w') as f:
-                f.write("[]")
-        
-        # Load GeoIP database if available
-        self.geoip_reader = None
-        if os.path.exists(self.geoip_db_path):
-            try:
-                self.geoip_reader = geoip2.database.Reader(self.geoip_db_path)
-                self.logger.info("GeoIP database loaded successfully.")
-            except Exception as e:
-                self.logger.error(f"Failed to load GeoIP database: {e}")
-
-        if self.siem_config:
-            # Start with a connection test
-            self._check_siem_connection()
-            
-            # Start the sender thread
-            self.siem_sender = threading.Thread(target=self._siem_sender_thread, daemon=True)
-            self.siem_sender.start()
-            self.logger.info(f"SIEM logging enabled to {self.siem_config['ip_address']}:{self.siem_config['port']}")
-    
-    def log_attack(self, service: str, attacker_ip: str, attacker_port: int, 
-                   command: str, additional_data: Dict[str, Any] = None) -> None:
-        """Log an attack to the unified log file"""
-        log_entry = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "service": service,
-            "attacker_ip": attacker_ip,
-            "attacker_port": attacker_port,
-            "command": command
-        }
-
-        # Add geolocation enrichment
-        if self.geoip_reader:
-            try:
-                response = self.geoip_reader.city(attacker_ip)
-                geo_info = {
-                    "country": response.country.name,
-                    "city": response.city.name,
-                    "asn": response.traits.autonomous_system_organization,
-                    "isp": response.traits.isp,
-                }
-                log_entry["geolocation"] = {k: v for k, v in geo_info.items() if v}
-            except Exception:
-                log_entry["geolocation"] = {}
-
-        # Add additional data if provided
-        if additional_data:
-            log_entry["additional_data"] = additional_data
-
-        # Write to unified log file
-        with open(self.unified_log_file, 'a') as f:
-            f.write(json.dumps(log_entry) + "\n")
-    
-    def _load_last_position(self) -> int:
-        """Load the last position sent to SIEM from file"""
-        try:
-            if os.path.exists(self.siem_position_file):
-                with open(self.siem_position_file, 'r') as f:
-                    content = f.read().strip()
-                    if content:
-                        return int(content)
-            return 0
-        except Exception as e:
-            self.logger.error(f"Error loading last SIEM position: {e}")
-            return 0
-    
-    def _save_last_position(self, position: int) -> None:
-        """Save the last position sent to SIEM to file"""
-        try:
-            with open(self.siem_position_file, 'w') as f:
-                f.write(str(position))
-        except Exception as e:
-            self.logger.error(f"Error saving last SIEM position: {e}")
-    
-    def _load_queue(self) -> list:
-        """Load the queue of logs waiting to be sent to SIEM"""
-        try:
-            if os.path.exists(self.siem_queue_file):
-                with open(self.siem_queue_file, 'r') as f:
-                    content = f.read().strip()
-                    if content:
-                        return json.loads(content)
-            return []
-        except Exception as e:
-            self.logger.error(f"Error loading SIEM queue: {e}")
-            return []
-    
-    def _save_queue(self, queue: list) -> None:
-        """Save the queue of logs waiting to be sent to SIEM"""
-        try:
-            with open(self.siem_queue_file, 'w') as f:
-                f.write(json.dumps(queue))
-        except Exception as e:
-            self.logger.error(f"Error saving SIEM queue: {e}")
-    
-    def _add_to_queue(self, log_entry: str) -> None:
-        """Add a log entry to the queue for later sending"""
-        try:
-            queue = self._load_queue()
-            queue.append(log_entry)
-            self._save_queue(queue)
-            self.logger.debug(f"Added log to SIEM queue. Queue size: {len(queue)}")
-        except Exception as e:
-            self.logger.error(f"Error adding to SIEM queue: {e}")
-    
-    def _process_queue(self) -> None:
-        """Process all entries in the queue and try to send them to SIEM"""
-        if not self.siem_connected:
-            return
-            
-        queue = self._load_queue()
-        if not queue:
-            return
-            
-        self.logger.info(f"Attempting to process SIEM queue with {len(queue)} entries")
-        remaining_queue = []
-        
-        for log_entry in queue:
-            send_success = self._send_to_siem(log_entry)
-            if not send_success:
-                # If send fails, keep this entry and all remaining ones in the queue
-                remaining_queue.append(log_entry)
-                remaining_queue.extend(queue[queue.index(log_entry) + 1:])
-                break
-                
-        if len(remaining_queue) < len(queue):
-            self.logger.info(f"Successfully sent {len(queue) - len(remaining_queue)} queued logs to SIEM")
-        
-        self._save_queue(remaining_queue)
-    
-    def _check_siem_connection(self) -> bool:
-        """Test the connection to the SIEM server"""
-        current_time = time.time()
-        
-        # Only try to reconnect every connection_retry_interval seconds
-        if (not self.siem_connected and 
-            current_time - self.last_connection_attempt < self.connection_retry_interval):
-            return self.siem_connected
-            
-        self.last_connection_attempt = current_time
-        
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(5)
-                sock.connect((self.siem_config["ip_address"], int(self.siem_config["port"])))
-                
-                # If we get here, connection succeeded
-                if not self.siem_connected:
-                    self.logger.info(f"SIEM connection established to {self.siem_config['ip_address']}:{self.siem_config['port']}")
-                
-                self.siem_connected = True
-                self.consecutive_failures = 0
-                return True
-                
-        except Exception as e:
-            self.consecutive_failures += 1
-            
-            if self.siem_connected:
-                self.logger.warning(f"SIEM connection lost: {e}")
-                
-            if self.consecutive_failures >= self.max_consecutive_failures:
-                if self.siem_connected:
-                    self.logger.error(f"SIEM connection marked as down after {self.consecutive_failures} consecutive failures")
-                self.siem_connected = False
-            
-            return False
-    
-    def _siem_sender_thread(self) -> None:
-        """Thread that monitors the log file and sends new entries to SIEM"""
-        last_sent_position = self._load_last_position()
-        self.logger.info(f"Starting SIEM sender thread from position: {last_sent_position}")
-        
-        while True:
-            try:
-                # Check connection status first
-                connection_status = self._check_siem_connection()
-                
-                # If connected, try to process any queued logs
-                if connection_status:
-                    self._process_queue()
-                    
-                # Process new logs from the main log file
-                if os.path.exists(self.unified_log_file):
-                    with open(self.unified_log_file, 'r') as f:
-                        f.seek(last_sent_position)
-                        new_lines = f.readlines()
-                        
-                        if new_lines:
-                            current_position = last_sent_position
-                            for line in new_lines:
-                                if line.strip():
-                                    line_position = current_position + len(line)
-                                    
-                                    # If connected, try to send directly
-                                    if self.siem_connected:
-                                        send_success = self._send_to_siem(line.strip())
-                                        if send_success:
-                                            last_sent_position = line_position
-                                        else:
-                                            # If send fails, add to queue and stop processing for now
-                                            self._add_to_queue(line.strip())
-                                            break
-                                    else:
-                                        # If disconnected, add to queue and continue to next line
-                                        self._add_to_queue(line.strip())
-                                        last_sent_position = line_position
-                                
-                                current_position += len(line)
-                            
-                            # Save our position
-                            self._save_last_position(last_sent_position)
-                
-                # Sleep before next check
-                # Use shorter sleep if we're connected, longer if not
-                sleep_time = 5 if self.siem_connected else self.connection_retry_interval
-                time.sleep(sleep_time)
-                
-            except Exception as e:
-                self.logger.error(f"Error in SIEM sender thread: {e}")
-                time.sleep(10)
-    
-    def _send_to_siem(self, log_entry: str) -> bool:
+    def __init__(self, host: str, port: int, config: Dict[str, Any], unified_logger=None):
         """
-        Send a log entry to the configured SIEM server
-        
-        Returns:
-            bool: True if send was successful, False otherwise
+        Initialize the MSSQL service
+
+        Args:
+            host: Host IP to bind to
+            port: Port to listen on
+            config: Global configuration dictionary
         """
+        super().__init__(host, port, config, "mssql")
+        self.unified_logger = unified_logger
+
+        # MSSQL specific configurations
+        self.server_version = self.service_config.get("server_version", "Microsoft SQL Server 2019")
+        self.server_name = self.service_config.get("server_name", "SQLSERVER")
+        self.instance_name = self.service_config.get("instance_name", "MSSQLSERVER")
+
+    def handle_client(self, client_socket: socket.socket, address: Tuple[str, int],
+                      connection_data: Dict[str, Any]) -> None:
+        connection_data["data"]["connection_time"] = datetime.datetime.now().isoformat()
+    
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(5)
-                sock.connect((self.siem_config["ip_address"], int(self.siem_config["port"])))
-                sock.sendall((log_entry + "\n").encode('utf-8'))
-                self.logger.debug(f"Sent log to SIEM: {log_entry}")
-                return True
-                
-        except Exception as e:
-            # Only log error if we think we're connected - prevents log flooding
-            if self.siem_connected:
-                self.logger.error(f"Failed to send log to SIEM: {e}")
-                
-            # Track connection state
-            self.consecutive_failures += 1
-            if self.consecutive_failures >= self.max_consecutive_failures:
-                if self.siem_connected:
-                    self.logger.warning(f"SIEM connection marked as down after {self.consecutive_failures} consecutive failures")
-                self.siem_connected = False
-                
-            return False
-
-def print_banner():
-    """Print the honeypot banner"""
-    banner = f"""
-{Fore.CYAN}╔═══════════════════════════════════════════════════════════╗
-║                                                           ║
-║  {Fore.YELLOW}    ██╗███████╗██████╗  █████╗ ██╗  ██╗ █████╗ ███╗   ██╗{Fore.CYAN}    ║
-║  {Fore.YELLOW}    ██║██╔════╝██╔══██╗██╔══██╗██║ ██╔╝██╔══██╗████╗  ██║{Fore.CYAN}    ║
-║  {Fore.YELLOW}    ██║█████╗  ██████╔╝███████║█████╔╝ ███████║██╔██╗ ██║{Fore.CYAN}    ║
-║  {Fore.YELLOW}██╗ ██║██╔══╝  ██╔══██╗██╔══██║██╔═██╗ ██╔══██║██║╚██╗██║{Fore.CYAN}    ║
-║  {Fore.YELLOW}╚█████╔╝███████╗██████╔╝██║  ██║██║  ██╗██║  ██║██║ ╚████║{Fore.CYAN}    ║
-║  {Fore.YELLOW} ╚════╝ ╚══════╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝{Fore.CYAN}    ║
-║                                                           ║
-║    {Fore.GREEN}A modular Python honeypot system for cybersecurity research{Fore.CYAN}    ║
-║                                                           ║
-╚═══════════════════════════════════════════════════════════╝
-    """
-    print(banner)
-
-def print_service_menu(config):
-    """Print the service selection menu"""
-    print(f"\n{Fore.CYAN}=== Available Services ===")
-    print(f"{Fore.YELLOW}Select services to enable (comma-separated list or 'all'):")
-
-    # Default ports for services that might be missing from config
-    default_ports = {
-        "ssh": 2222,
-        "http": 8080,
-        "ftp": 2121,
-        "telnet": 2323,
-        "mysql": 3306,
-        "mssql": 1433,
-        "rdp": 3389,
-        "vnc": 5900,
-        "redis": 6379,
-        "elasticsearch": 9200,
-        "docker": 2375
-    }
-
-    services = []
-    for service_name, default_port in default_ports.items():
-        # Get port from config if it exists, otherwise use default
-        port = config["services"].get(service_name, {}).get("port", default_port)
-        services.append((service_name, port))
-
-    for i, (service, port) in enumerate(services, 1):
-        port_status = check_port_available(config["network"]["bind_ip"], port)
-        if port_status:
-            status = f"{Fore.GREEN}[Available]"
-        else:
-            status = f"{Fore.RED}[Port in use]"
-
-        print(f"{i}. {service.upper()} (Port {port}) {status}")
-
-    print(f"\n{Fore.YELLOW}Additional options:")
-    print(f"{Fore.CYAN}S. {Fore.WHITE}Configure SIEM")
-    print(f"{Fore.CYAN}Q. {Fore.WHITE}Quit\n")
-
-def main():
-    global logger, running
-
-    # Handle 'help' manually BEFORE parsing arguments
-    if len(sys.argv) > 1 and sys.argv[1].lower() == "help":
-        print("\nUsage:")
-        print("  python jebakan.py --help          Show this help message and exit")
-        print("  python jebakan.py --config-siem    Configure SIEM integration")
-        print("  python jebakan.py [options]        Start honeypot with selected options")
-        sys.exit(0)
-
-    parser = argparse.ArgumentParser(description="Python Honeypot System")
-    parser.add_argument("-c", "--config", help="Path to configuration file", default="config/honeypot.json")
-    parser.add_argument("-v", "--verbose", help="Increase output verbosity", action="store_true")
-    parser.add_argument("-n", "--no-prompt", help="Start with default services (no interactive prompt)", action="store_true")
-    parser.add_argument("--interaction", choices=["low", "medium", "high"],
-                        help="Set global interaction level for all services")
-    parser.add_argument("--services", help="Comma-separated list of services to enable or 'all'", type=str)
-    parser.add_argument("--config-siem", action="store_true", help="Configure SIEM integration")
-    args = parser.parse_args()
-
-    print_banner()
-    config = load_config(args.config)
-
-    if args.verbose:
-        config["logging"]["level"] = "DEBUG"
-        config["logging"]["console"] = True
-
-    # Apply global interaction level if specified
-    if args.interaction:
-        for service in config.get("services", {}):
-            config["services"].setdefault(service, {})
-            config["services"][service]["interaction_level"] = args.interaction
-
-        default_ports = {
-            "ssh": 2222, "http": 8080, "ftp": 2121, "telnet": 2323,
-            "mysql": 3306, "mssql": 1433, "rdp": 3389, "vnc": 5900,
-            "redis": 6379, "elasticsearch": 9200, "docker": 2375
-        }
-        for svc, port in default_ports.items():
-            if svc not in config["services"]:
-                config["services"][svc] = {
-                    "enabled": False,
-                    "port": port,
-                    "interaction_level": args.interaction
-                }
-
-        config["global_interaction_level"] = args.interaction
-        save_config(config, args.config)
-
-    logger = setup_logging(config)
-    logger.info("Starting honeypot system...")
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    if args.no_prompt:
-        services_to_enable = [s for s, scfg in config["services"].items() if scfg.get("enabled")]
-
-    else:
-        result = select_services(config, args)
-        if result is None:
-            print(f"{Fore.YELLOW}Exiting...")
-            return
-        services_to_enable = result
-
-        print(f"[DEBUG] main(): Got services_to_enable: {services_to_enable}")
-
-        save_config(config, args.config)
-
-    started_services = start_services(config, services_to_enable, unified_logger)
-
-
-def print_status(started_services):
-    """Print the status of started services"""
-    if not started_services:
-        print(f"\n{Fore.RED}No services were started.")
-        return
-
-    print(f"\n{Fore.GREEN}=== Honeypot Status ===")
-    print(f"{Fore.CYAN}The following services are running:")
-
-    for service, port in started_services:
-        print(f"  {Fore.GREEN}✓ {service} on port {port}")
-
-    print(f"\n{Fore.YELLOW}Press Ctrl+C to stop the honeypot.")
-    print(f"{Style.RESET_ALL}")
-
-
-def select_services(config, args):
-    """Prompt user to select services to enable"""
-    from utils.config_manager import save_config
-
-    if "global_interaction_level" not in config:
-        config["global_interaction_level"] = args.interaction or "high"
-
-    print_service_menu(config)
-
-    service_map = [
-        "ssh", "http", "ftp", "telnet", "mysql", "mssql",
-        "rdp", "vnc", "redis", "elasticsearch", "docker"
-    ]
-    default_ports = {
-        "ssh": 2222, "http": 8080, "ftp": 2121, "telnet": 2323,
-        "mysql": 3306, "mssql": 1433, "rdp": 3389, "vnc": 5900,
-        "redis": 6379, "elasticsearch": 9200, "docker": 2375
-    }
-
-    while True:
-        try:
-            raw = input(f"\n{Fore.GREEN}Enter your selection: {Style.RESET_ALL}")
-            cleaned = raw.strip().lower()
-            print(f"[DEBUG] Raw input: {repr(raw)}")
-
-            if cleaned == 'q':
-                return None
-
-            if cleaned == 's':
-                print(f"\n{Fore.CYAN}=== SIEM Configuration ==={Style.RESET_ALL}")
-                ip_address = input("Enter SIEM server IP address: ").strip()
-                port = input("Enter SIEM server port: ").strip()
-
-                try:
-                    socket.inet_aton(ip_address)
-                    port = int(port)
-                    if not (1 <= port <= 65535):
-                        raise ValueError("Port must be between 1 and 65535")
-
-                    if "services" not in config:
-                        config["services"] = {}
-
-                    config["services"]["siem"] = {
-                        "enabled": True,
-                        "ip_address": ip_address,
-                        "port": port
-                    }
-
-                    save_config(config, args.config)
-                    print(f"{Fore.GREEN}SIEM configuration saved successfully{Style.RESET_ALL}")
-
-                except socket.error:
-                    print(f"{Fore.RED}Invalid IP address format{Style.RESET_ALL}")
-                except ValueError as e:
-                    print(f"{Fore.RED}Invalid port: {e}{Style.RESET_ALL}")
-                except Exception as e:
-                    print(f"{Fore.RED}Error updating configuration: {e}{Style.RESET_ALL}")
-
-                continue
-
-            if cleaned == 'all':
-                cleaned = ','.join(str(i) for i in range(1, len(service_map) + 1))
-                print(f"[DEBUG] Interpreting 'all' as: {cleaned}")
-
-            cleaned = cleaned.replace(' ', '')
-            selected_services = []
-
-            for part in cleaned.split(','):
-                if part.isdigit():
-                    idx = int(part) - 1
-                    if 0 <= idx < len(service_map):
-                        selected_services.append(service_map[idx])
-                elif part in service_map:
-                    selected_services.append(part)
-
-            print(f"[DEBUG] Selected services: {selected_services}")
-            services_to_enable = []
-
-            for svc in selected_services:
-                config["services"].setdefault(svc, {
-                    "port": default_ports[svc],
-                    "enabled": True,
-                    "interaction_level": config["global_interaction_level"]
-                })
-                config["services"][svc]["enabled"] = True
-                config["services"][svc].setdefault("interaction_level", config["global_interaction_level"])
-                services_to_enable.append(svc)
-
-            if not services_to_enable:
-                print(f"{Fore.RED}No valid services selected. Please try again.")
-                continue
-
-            save_config(config, args.config)
-            logger.info(f"Saved configuration to {args.config}")
-            return services_to_enable
-
-        except Exception as e:
-            print(f"{Fore.RED}Error: {e}. Please try again.")
-
-def start_services(config, services_to_enable, unified_logger=None):
-    """Start all enabled services based on configuration"""
-    global active_services
-
-    started_services = []
-
-    # Print debugging information
-    print(f"Attempting to start services: {services_to_enable}")
-
-    try:
-        if "ssh" in services_to_enable:
-            try:
-                # Check if port is available
-                if check_port_available(config["network"]["bind_ip"], config["services"]["ssh"]["port"]):
-                    from services.ssh_service import SSHService
-
-                    print(f"Starting SSH service on {config['network']['bind_ip']}:{config['services']['ssh']['port']}")
-
-                    ssh_service = SSHService(
-                        host=config["network"]["bind_ip"],
-                        port=config["services"]["ssh"]["port"],
-                        config=config,
-                        unified_logger=unified_logger
-                    )
-                    ssh_thread = threading.Thread(target=ssh_service.start)
-                    ssh_thread.daemon = True
-                    ssh_thread.start()
-                    active_services.append(("SSH", ssh_service, ssh_thread))
-                    started_services.append(("SSH", config["services"]["ssh"]["port"]))
-                    print(f"SSH honeypot started on port {config['services']['ssh']['port']}")
-                else:
-                    print(f"Port {config['services']['ssh']['port']} is already in use, cannot start SSH service")
-            except ImportError as e:
-                print(f"Failed to import SSH service module: {e}")
-            except Exception as e:
-                print(f"Failed to start SSH service: {e}")
-                import traceback
-                traceback.print_exc()
-
-        if "http" in services_to_enable:
-            try:
-                # Check if port is available
-                if check_port_available(config["network"]["bind_ip"], config["services"]["http"]["port"]):
-                    from services.http_service import HTTPService
-
-                    print(f"Starting HTTP service on {config['network']['bind_ip']}:{config['services']['http']['port']}")
-
-                    http_service = HTTPService(
-                        host=config["network"]["bind_ip"],
-                        port=config["services"]["http"]["port"],
-                        config=config,
-                        unified_logger=unified_logger
-                    )
-                    http_thread = threading.Thread(target=http_service.start)
-                    http_thread.daemon = True
-                    http_thread.start()
-                    active_services.append(("HTTP", http_service, http_thread))
-                    started_services.append(("HTTP", config["services"]["http"]["port"]))
-                    print(f"HTTP honeypot started on port {config['services']['http']['port']}")
-                else:
-                    print(f"Port {config['services']['http']['port']} is already in use, cannot start HTTP service")
-            except ImportError as e:
-                print(f"Failed to import HTTP service module: {e}")
-            except Exception as e:
-                print(f"Failed to start HTTP service: {e}")
-                import traceback
-                traceback.print_exc()
-
-        if "ftp" in services_to_enable:
-            try:
-                # Check if port is available
-                if check_port_available(config["network"]["bind_ip"], config["services"]["ftp"]["port"]):
-                    from services.ftp_service import FTPService
-
-                    print(f"Starting FTP service on {config['network']['bind_ip']}:{config['services']['ftp']['port']}")
-
-                    ftp_service = FTPService(
-                        host=config["network"]["bind_ip"],
-                        port=config["services"]["ftp"]["port"],
-                        config=config,
-                        unified_logger=unified_logger
-                    )
-                    ftp_thread = threading.Thread(target=ftp_service.start)
-                    ftp_thread.daemon = True
-                    ftp_thread.start()
-                    active_services.append(("FTP", ftp_service, ftp_thread))
-                    started_services.append(("FTP", config["services"]["ftp"]["port"]))
-                    print(f"FTP honeypot started on port {config['services']['ftp']['port']}")
-                else:
-                    print(f"Port {config['services']['ftp']['port']} is already in use, cannot start FTP service")
-            except ImportError as e:
-                print(f"Failed to import FTP service module: {e}")
-            except Exception as e:
-                print(f"Failed to start FTP service: {e}")
-                import traceback
-                traceback.print_exc()
-
-        if "telnet" in services_to_enable:
-            try:
-                # Check if port is available
-                if check_port_available(config["network"]["bind_ip"], config["services"]["telnet"]["port"]):
-                    from services.telnet_service import TelnetService
-
-                    print(f"Starting Telnet service on {config['network']['bind_ip']}:{config['services']['telnet']['port']}")
-
-                    telnet_service = TelnetService(
-                        host=config["network"]["bind_ip"],
-                        port=config["services"]["telnet"]["port"],
-                        config=config,
-                        unified_logger=unified_logger
-                    )
-                    telnet_thread = threading.Thread(target=telnet_service.start)
-                    telnet_thread.daemon = True
-                    telnet_thread.start()
-                    active_services.append(("Telnet", telnet_service, telnet_thread))
-                    started_services.append(("Telnet", config["services"]["telnet"]["port"]))
-                    print(f"Telnet honeypot started on port {config['services']['telnet']['port']}")
-                else:
-                    print(f"Port {config['services']['telnet']['port']} is already in use, cannot start Telnet service")
-            except ImportError as e:
-                print(f"Failed to import Telnet service module: {e}")
-            except Exception as e:
-                print(f"Failed to start Telnet service: {e}")
-                import traceback
-                traceback.print_exc()
-
-        if "mysql" in services_to_enable:
-            try:
-                # Check if port is available
-                if check_port_available(config["network"]["bind_ip"], config["services"]["mysql"]["port"]):
-                    from services.mysql_service import MySQLService
-
-                    print(f"Starting MySQL service on {config['network']['bind_ip']}:{config['services']['mysql']['port']}")
-
-                    mysql_service = MySQLService(
-                        host=config["network"]["bind_ip"],
-                        port=config["services"]["mysql"]["port"],
-                        config=config,
-                        unified_logger=unified_logger
-                    )
-                    mysql_thread = threading.Thread(target=mysql_service.start)
-                    mysql_thread.daemon = True
-                    mysql_thread.start()
-                    active_services.append(("MySQL", mysql_service, mysql_thread))
-                    started_services.append(("MySQL", config["services"]["mysql"]["port"]))
-                    print(f"MySQL honeypot started on port {config['services']['mysql']['port']}")
-                else:
-                    print(f"Port {config['services']['mysql']['port']} is already in use, cannot start MySQL service")
-            except ImportError as e:
-                print(f"Failed to import MySQL service module: {e}")
-            except Exception as e:
-                print(f"Failed to start MySQL service: {e}")
-                import traceback
-                traceback.print_exc()
-
-        if "mssql" in services_to_enable:
-            try:
-                # Check if port is available
-                if check_port_available(config["network"]["bind_ip"], config["services"]["mssql"]["port"]):
-                    from services.mssql_service import MSSQLService
-
-                    print(f"Starting MSSQL service on {config['network']['bind_ip']}:{config['services']['mssql']['port']}")
-
-                    mssql_service = MSSQLService(
-                        host=config["network"]["bind_ip"],
-                        port=config["services"]["mssql"]["port"],
-                        config=config,
-                        unified_logger=unified_logger
-                    )
-                    mssql_thread = threading.Thread(target=mssql_service.start)
-                    mssql_thread.daemon = True
-                    mssql_thread.start()
-                    active_services.append(("MSSQL", mssql_service, mssql_thread))
-                    started_services.append(("MSSQL", config["services"]["mssql"]["port"]))
-                    print(f"MSSQL honeypot started on port {config['services']['mssql']['port']}")
-                else:
-                    print(f"Port {config['services']['mssql']['port']} is already in use, cannot start MSSQL service")
-            except ImportError as e:
-                print(f"Failed to import MSSQL service module: {e}")
-            except Exception as e:
-                print(f"Failed to start MSSQL service: {e}")
-                import traceback
-                traceback.print_exc()
-
-        if "rdp" in services_to_enable:
-            try:
-                # Check if port is available
-                if check_port_available(config["network"]["bind_ip"], config["services"]["rdp"]["port"]):
-                    from services.rdp_service import RDPService
-
-                    print(f"Starting RDP service on {config['network']['bind_ip']}:{config['services']['rdp']['port']}")
-
-                    rdp_service = RDPService(
-                        host=config["network"]["bind_ip"],
-                        port=config["services"]["rdp"]["port"],
-                        config=config,
-                        unified_logger=unified_logger
-                    )
-                    rdp_thread = threading.Thread(target=rdp_service.start)
-                    rdp_thread.daemon = True
-                    rdp_thread.start()
-                    active_services.append(("RDP", rdp_service, rdp_thread))
-                    started_services.append(("RDP", config["services"]["rdp"]["port"]))
-                    print(f"RDP honeypot started on port {config['services']['rdp']['port']}")
-                else:
-                    print(f"Port {config['services']['rdp']['port']} is already in use, cannot start RDP service")
-            except ImportError as e:
-                print(f"Failed to import RDP service module: {e}")
-            except Exception as e:
-                print(f"Failed to start RDP service: {e}")
-                import traceback
-                traceback.print_exc()
-
-        if "vnc" in services_to_enable:
-            try:
-                # Check if port is available
-                if check_port_available(config["network"]["bind_ip"], config["services"]["vnc"]["port"]):
-                    from services.vnc_service import VNCService
-
-                    print(f"Starting VNC service on {config['network']['bind_ip']}:{config['services']['vnc']['port']}")
-
-                    vnc_service = VNCService(
-                        host=config["network"]["bind_ip"],
-                        port=config["services"]["vnc"]["port"],
-                        config=config,
-                        unified_logger=unified_logger
-                    )
-                    vnc_thread = threading.Thread(target=vnc_service.start)
-                    vnc_thread.daemon = True
-                    vnc_thread.start()
-                    active_services.append(("VNC", vnc_service, vnc_thread))
-                    started_services.append(("VNC", config["services"]["vnc"]["port"]))
-                    print(f"VNC honeypot started on port {config['services']['vnc']['port']}")
-                else:
-                    print(f"Port {config['services']['vnc']['port']} is already in use, cannot start VNC service")
-            except ImportError as e:
-                print(f"Failed to import VNC service module: {e}")
-            except Exception as e:
-                print(f"Failed to start VNC service: {e}")
-                import traceback
-                traceback.print_exc()
-
-        if "redis" in services_to_enable:
-            try:
-                # Check if port is available
-                if check_port_available(config["network"]["bind_ip"], config["services"]["redis"]["port"]):
-                    from services.redis_service import RedisService
-
-                    print(f"Starting Redis service on {config['network']['bind_ip']}:{config['services']['redis']['port']}")
-
-                    redis_service = RedisService(
-                        host=config["network"]["bind_ip"],
-                        port=config["services"]["redis"]["port"],
-                        config=config,
-                        unified_logger=unified_logger
-                    )
-                    redis_thread = threading.Thread(target=redis_service.start)
-                    redis_thread.daemon = True
-                    redis_thread.start()
-                    active_services.append(("Redis", redis_service, redis_thread))
-                    started_services.append(("Redis", config["services"]["redis"]["port"]))
-                    print(f"Redis honeypot started on port {config['services']['redis']['port']}")
-                else:
-                    print(f"Port {config['services']['redis']['port']} is already in use, cannot start Redis service")
-            except ImportError as e:
-                print(f"Failed to import Redis service module: {e}")
-            except Exception as e:
-                print(f"Failed to start Redis service: {e}")
-                import traceback
-                traceback.print_exc()
-
-        if "elasticsearch" in services_to_enable:
-            try:
-                # Check if port is available
-                if check_port_available(config["network"]["bind_ip"], config["services"]["elasticsearch"]["port"]):
-                    from services.elasticsearch_service import ElasticsearchService
-
-                    print(f"Starting Elasticsearch service on {config['network']['bind_ip']}:{config['services']['elasticsearch']['port']}")
-
-                    elasticsearch_service = ElasticsearchService(
-                        host=config["network"]["bind_ip"],
-                        port=config["services"]["elasticsearch"]["port"],
-                        config=config,
-                        unified_logger=unified_logger
-                    )
-                    elasticsearch_thread = threading.Thread(target=elasticsearch_service.start)
-                    elasticsearch_thread.daemon = True
-                    elasticsearch_thread.start()
-                    active_services.append(("Elasticsearch", elasticsearch_service, elasticsearch_thread))
-                    started_services.append(("Elasticsearch", config["services"]["elasticsearch"]["port"]))
-                    print(f"Elasticsearch honeypot started on port {config['services']['elasticsearch']['port']}")
-                else:
-                    print(f"Port {config['services']['elasticsearch']['port']} is already in use, cannot start Elasticsearch service")
-            except ImportError as e:
-                print(f"Failed to import Elasticsearch service module: {e}")
-            except Exception as e:
-                print(f"Failed to start Elasticsearch service: {e}")
-                import traceback
-                traceback.print_exc()
-
-        if "docker" in services_to_enable:
-            try:
-                # Check if port is available
-                if check_port_available(config["network"]["bind_ip"], config["services"]["docker"]["port"]):
-                    from services.docker_service import DockerService
-
-                    print(f"Starting Docker service on {config['network']['bind_ip']}:{config['services']['docker']['port']}")
-
-                    docker_service = DockerService(
-                        host=config["network"]["bind_ip"],
-                        port=config["services"]["docker"]["port"],
-                        config=config,
-                        unified_logger=unified_logger
-                    )
-                    docker_thread = threading.Thread(target=docker_service.start)
-                    docker_thread.daemon = True
-                    docker_thread.start()
-                    active_services.append(("Docker", docker_service, docker_thread))
-                    started_services.append(("Docker", config["services"]["docker"]["port"]))
-                    print(f"Docker API honeypot started on port {config['services']['docker']['port']}")
-                else:
-                    print(f"Port {config['services']['docker']['port']} is already in use, cannot start Docker service")
-            except ImportError as e:
-                print(f"Failed to import Docker service module: {e}")
-            except Exception as e:
-                print(f"Failed to start Docker service: {e}")
-                import traceback
-                traceback.print_exc()
-
-    except Exception as e:
-        print(f"Error starting services: {e}")
-        import traceback
-        traceback.print_exc()
-
-    return started_services
-
-def check_port_available(host, port):
-    """Check if a port is available on the host"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind((host, port))
-            s.close()
-            return True
-        except OSError:
-            return False
-
-def print_status(started_services, dashboard_port=None, analytics_enabled=False):
-    """Print the status of started services"""
-    if not started_services and not dashboard_port and not analytics_enabled:
-        print(f"\n{Fore.RED}No services were started.")
-        return
-
-    print(f"\n{Fore.GREEN}=== Honeypot Status ===")
-    print(f"{Fore.CYAN}The following services are running:")
-
-    for service, port in started_services:
-        print(f"  {Fore.GREEN}✓ {service} on port {port}")
-
-    if dashboard_port:
-        print(f"  {Fore.GREEN}✓ Dashboard on port {dashboard_port} (http://localhost:{dashboard_port})")
-
-    if analytics_enabled:
-        print(f"  {Fore.GREEN}✓ Analytics engine is running")
-
-    print(f"\n{Fore.YELLOW}Press Ctrl+C to stop the honeypot.")
-    print(f"{Style.RESET_ALL}")
-
-def main():
-    global logger, running
-
-    # Define the valid services from service_map
-    service_map = [
-        "ssh", "http", "ftp", "telnet", "mysql", "mssql",
-        "rdp", "vnc", "redis", "elasticsearch", "docker"
-    ]
-    service_choices = ', '.join(service_map)
-
-    # Handle 'help' manually BEFORE parsing arguments
-    if len(sys.argv) > 1 and sys.argv[1].lower() == "help":
-        print("\nUsage:")
-        print("  python jebakan.py --help          Show this help message and exit")
-        print("  python jebakan.py --config-siem    Configure SIEM integration")
-        print("  python jebakan.py [options]        Start honeypot with selected options")
-        sys.exit(0)
-
-    parser = argparse.ArgumentParser(description="Python Honeypot System")
-    parser.add_argument("-c", "--config", help="Path to configuration file", default="config/honeypot.json")
-    parser.add_argument("-v", "--verbose", help="Increase output verbosity", action="store_true")
-    parser.add_argument("-n", "--no-prompt", help="Start with default services (no interactive prompt)", action="store_true")
-    parser.add_argument("--interaction", choices=["low", "medium", "high"],
-                        help="Set global interaction level for all services")
-    parser.add_argument("--services", help="Comma-separated list of services to enable or 'all'", type=str)
-    parser.add_argument("--config-siem", action="store_true", help="Configure SIEM integration")
-    args = parser.parse_args()
-
-
-    # Check for config-siem command
-    if args.config_siem:
-        print("\n=== SIEM Configuration ===")
-        ip_address = input("Enter SIEM server IP address: ").strip()
-        port = input("Enter SIEM server port: ").strip()
-
-        try:
-            socket.inet_aton(ip_address)
-            port = int(port)
-            if not (1 <= port <= 65535):
-                raise ValueError("Port must be between 1 and 65535")
-
-            # Load existing config
-            config = load_config(args.config)
-
-            # Write SIEM settings directly at root
-            config["siem-server"] = {
-                "enabled": True,
-                "ip_address": ip_address,
-                "port": port
+            self._handle_prelogin(client_socket)
+            login_packet = self._receive_tds_packet(client_socket)
+            if not login_packet:
+                return
+    
+            username, password = self._parse_login_packet(login_packet)
+    
+            auth_data = {
+                "username": username,
+                "password": password,
+                "timestamp": datetime.datetime.now().isoformat()
             }
-
-            # Save updated config
-            save_config(config, args.config)
-            print("SIEM configuration saved successfully.")
-
-        except Exception as e:
-            print(f"Error configuring SIEM: {e}")
-
-        sys.exit(0)
-
-    # Print banner
-    print_banner()
-
-    # Load configuration
-    config = load_config(args.config)
-
-    # Override logging settings if specified
-    if args.verbose:
-        config["logging"]["level"] = "DEBUG"
-        config["logging"]["console"] = True
-
-    # If interaction level was provided, apply it globally
-    if args.interaction:
-        config["global_interaction_level"] = args.interaction
-        for svc in config.get("services", {}).values():
-            svc["interaction_level"] = args.interaction
-
-    # Set up logging
-    logger = setup_logging(config)
-    logger.info("Starting honeypot system...")
-
-    # Initialize unified logger (add this line)
-    unified_logger = UnifiedLogger(config)
-
-    # Set up signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    services_to_enable = []
-    enable_dashboard = False
-    enable_analytics = False
-
-    if args.no_prompt or args.services:
-        if args.services:
-            cleaned = args.services.strip().lower()
-            if cleaned == "all":
-                services_to_enable = service_map
+    
+            connection_data["data"].setdefault("auth_attempts", []).append(auth_data)
+    
+            self.logger.info(f"MSSQL authentication attempt from {address[0]} with username '{username}' and password '{password}'")
+    
+            # Log the authentication attempt to the unified logger
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="mssql",
+                    attacker_ip=address[0],
+                    attacker_port=address[1],
+                    command="login_attempt",
+                    additional_data=auth_data
+                )
+    
+            valid_creds = self.service_config.get("credentials", [])
+            if any(c["username"] == username and c["password"] == password for c in valid_creds):
+                self._send_login_success(client_socket)
+                self._sql_interaction_loop(client_socket, address, connection_data)
             else:
-                parts = [p.strip() for p in cleaned.split(',')]
-                services_to_enable = [s for s in parts if s in service_map]
-        else:
-            for s, scfg in config["services"].items():
-                if scfg.get("enabled", False):
-                    services_to_enable.append(s)
+                self._send_login_error(client_socket)
+    
+        except Exception as e:
+            self.logger.error(f"Error handling MSSQL client: {e}")
+            connection_data["error"] = str(e)
+        finally:
+            client_socket.close()
 
-        enable_dashboard = config["dashboard"]["enabled"]
-        enable_analytics = config["analytics"]["enabled"]
-    else:
-        result = select_services(config, args)
-        if not result:
-            print(f"{Fore.YELLOW}Exiting...")
+    def _handle_prelogin(self, client_socket: socket.socket) -> None:
+        prelogin_packet = self._receive_tds_packet(client_socket)
+        if not prelogin_packet:
             return
+    
+        response = bytearray()
+    
+        # Version
+        response.extend(b'\x00')            # VERSION token
+        response.extend(b'\x00\x08')        # Offset
+        response.extend(b'\x00\x06')        # Length
+    
+        # Encryption
+        response.extend(b'\x01')            # ENCRYPTION token
+        response.extend(b'\x00\x0E')
+        response.extend(b'\x00\x01')
+    
+        # Terminator
+        response.extend(b'\xFF')
+    
+        # Data section
+        # Fake server version: 15.0.2000.5 (SQL Server 2019)
+        response.extend(struct.pack(">I", 0x0F000000))  # Major.Minor
+        response.extend(struct.pack(">H", 2000))        # Build
+        response.extend(b'\x05')                        # Sub-build or patch
+        response.extend(b'\x02')                        # ENCRYPT login only
+    
+        self._send_tds_packet(client_socket, response, 0x04)
 
-        services_to_enable = result
+    def _parse_login_packet(self, packet: bytes) -> Tuple[str, str]:
+        try:
+            pos = 36
+            pos += 4  # Skip hostname offset
+        
+            def safe_unpack(offset):
+                if offset + 2 > len(packet):
+                    raise ValueError(f"Packet too short to unpack at offset {offset}")
+                return struct.unpack("<H", packet[offset:offset + 2])[0]
+        
+            username_offset = safe_unpack(pos)
+            pos += 2
+            username_len = safe_unpack(pos)
+            pos += 2
+        
+            password_offset = safe_unpack(pos)
+            pos += 2
+            password_len = safe_unpack(pos)
+            pos += 2
+        
+            # Add extra validation to prevent index errors
+            if (username_offset + username_len * 2 > len(packet) or 
+                password_offset + password_len * 2 > len(packet)):
+                self.logger.warning("Invalid offsets in login packet")
+                return "", ""
+                
+            username_bytes = packet[username_offset:username_offset + username_len * 2]
+            password_bytes = packet[password_offset:password_offset + password_len * 2]
+        
+            username = username_bytes.decode("utf-16-le", errors="ignore")
+            password = self._decode_tds_password(password_bytes)
+        
+            self.logger.debug(f"Extracted username: {username}")
+            return username, password
+        
+        except Exception as e:
+            self.logger.error(f"Exception in _parse_login_packet: {e}")
+            return "", ""
+    
+    def _decode_tds_password(self, data: bytes) -> str:
+        result = bytearray()
+        for b in data:
+            xored = b ^ 0xA5
+            swapped = ((xored & 0x0F) << 4) | ((xored & 0xF0) >> 4)
+            result.append(swapped)
+        try:
+            return result.decode('utf-16-le')
+        except UnicodeDecodeError:
+            return "<decode error>"
 
-    # Start services (modify to pass unified_logger)
-    started_services = start_services(config, services_to_enable, unified_logger)
+    def _send_login_error(self, client_socket: socket.socket) -> None:
+        """
+        Send MSSQL login error response
 
-    # Save updated interaction level if set via CLI
-    if args.interaction:
-        save_config(config, args.config)
-        logger.info(f"Saved global interaction level '{args.interaction}' to {args.config}")
+        Args:
+            client_socket: Client socket object
+        """
+        # Build an error message packet
+        error_message = "Login failed for user. The user is not associated with a trusted SQL Server connection."
 
-    # Print status
-    print_status(started_services)
-    logger.info(f"Honeypot started with {len(started_services)} service(s)")
+        # TDS token for error message
+        token = 0xAA  # ERROR token
 
-    # Keep the main thread alive
-    try:
-        while running:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        running = False
-        logger.info("Shutting down honeypot...")
+        # Create the error message packet
+        packet = bytearray()
+        packet.append(token)  # Token type
 
-if __name__ == "__main__":
-    main()
+        # Error number (4 bytes) - 18456 is "Login failed"
+        packet.extend(struct.pack("<I", 18456))
+
+        # State (1 byte)
+        packet.append(1)
+
+        # Class (1 byte) - 14 is login error
+        packet.append(14)
+
+        # Message length (2 bytes, in Unicode characters)
+        packet.extend(struct.pack("<H", len(error_message)))
+
+        # Message (Unicode)
+        packet.extend(error_message.encode('utf-16-le'))
+
+        # Server name length (1 byte)
+        packet.append(len(self.server_name))
+
+        # Server name
+        packet.extend(self.server_name.encode('utf-8'))
+
+        # Procedure name length (1 byte)
+        packet.append(0)
+
+        # Line number (4 bytes)
+        packet.extend(struct.pack("<I", 1))
+
+        # Send the error packet
+        self._send_tds_packet(client_socket, packet, 0x04)  # 0x04 = TDS response
+
+    def _receive_tds_packet(self, client_socket: socket.socket) -> bytes:
+        try:
+            # Set a reasonable timeout
+            client_socket.settimeout(5.0)
+            
+            # Receive TDS packet header (8 bytes)
+            header = b""
+            bytes_received = 0
+            while bytes_received < 8:
+                chunk = client_socket.recv(8 - bytes_received)
+                if not chunk:
+                    self.logger.warning("Connection closed while receiving header")
+                    return b""
+                header += chunk
+                bytes_received += len(chunk)
+            
+            if len(header) < 8:
+                self.logger.warning(f"Incomplete TDS header received: {len(header)} bytes")
+                return b""
+            
+            # Parse packet length (2 bytes at offset 2)
+            # Keep the original format that was working
+            length = struct.unpack(">H", header[2:4])[0]
+            
+            # Sanity check for length
+            if length < 8 or length > 32768:
+                self.logger.warning(f"Invalid TDS packet length: {length}")
+                return b""
+            
+            # Receive packet data
+            data = b""
+            remaining = length - 8  # Subtract header size
+            
+            while remaining > 0:
+                chunk = client_socket.recv(min(remaining, 4096))  # Read in chunks
+                if not chunk:
+                    self.logger.warning(f"Connection closed while receiving data")
+                    break
+                data += chunk
+                remaining -= len(chunk)
+            
+            return data
+                
+        except socket.timeout:
+            self.logger.warning("Socket timeout while receiving TDS packet")
+            return b""
+        except Exception as e:
+            self.logger.error(f"Error receiving TDS packet: {e}")
+            return b""
+
+    def _send_tds_packet(self, client_socket: socket.socket, data: bytes, packet_type: int) -> None:
+        """
+        Send a TDS packet
+    
+        Args:
+            client_socket: Client socket object
+            data: Packet data
+            packet_type: TDS packet type
+        """
+        try:
+            # Calculate total packet length
+            length = len(data) + 8  # Data + header
+    
+            # Create TDS packet header (8 bytes)
+            header = bytearray()
+            header.append(packet_type)  # Packet type
+            header.append(0x01)  # Status: EOM (End Of Message)
+            header.extend(struct.pack(">H", length))  # Keep original format
+            header.extend(b'\x00\x00')  # SPID (Server Process ID)
+            header.append(0x00)  # Packet ID
+            header.append(0x00)  # Window
+    
+            # Send packet header and data
+            self.logger.debug(f"TDS SEND: type={packet_type}, len={len(data)}")
+            client_socket.sendall(header + data)
+    
+        except Exception as e:
+            self.logger.error(f"Error sending TDS packet: {e}")
+
+    def _send_login_success(self, client_socket: socket.socket) -> None:
+        """Simulate a successful MSSQL login."""
+        token = 0xAD  # Hypothetical success token
+        packet = bytearray()
+        packet.append(token)
+        packet.extend(b'\x00\x00\x00\x00')  # Dummy data
+        self._send_tds_packet(client_socket, packet, 0x04)
+
+    def _sql_interaction_loop(self, client_socket: socket.socket, address: Tuple[str, int],
+                              connection_data: Dict[str, Any]) -> None:
+        try:
+            self.logger.info(f"Sending SQL login banner to {address[0]}")
+            headers, rows = self._generate_fake_sql_response("welcome")
+            self._send_fake_result(client_socket, headers, rows)
+    
+            while True:
+                command = self._receive_sql_command(client_socket)
+                if not command:
+                    break
+    
+                connection_data["data"].setdefault("sql_commands", []).append({
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "command": command
+                })
+    
+                self.logger.info(f"SQL command from {address[0]}: {command}")
+
+                # Log command execution to unified logger
+                if self.unified_logger:
+                    self.unified_logger.log_attack(
+                        service="mssql",
+                        attacker_ip=address[0],
+                        attacker_port=address[1],
+                        command=command
+                    )
+
+                headers, rows = self._generate_fake_sql_response(command)
+                self._send_fake_result(client_socket, headers, rows)
+    
+        except Exception as e:
+            self.logger.error(f"Error in SQL interaction: {e}")
+
+    def _receive_sql_command(self, client_socket: socket.socket) -> str:
+        """
+        Receive SQL command from client
+        
+        Args:
+            client_socket: Client socket object
+            
+        Returns:
+            SQL command string
+        """
+        try:
+            data = self._receive_tds_packet(client_socket)
+            if not data:
+                return ""
+            
+            # SQL commands in TDS format typically start with a command token
+            # Skip the first byte (token) and return the actual SQL command
+            if len(data) > 1:
+                # Look for string-like data (typically after token byte)
+                for i in range(len(data)):
+                    if 32 <= data[i] < 127:  # Printable ASCII range
+                        sql = data[i:].decode('utf-8', errors='ignore').strip()
+                        # Clean up any null terminators or control characters
+                        sql = ''.join(char for char in sql if 32 <= ord(char) < 127 or char in '\r\n\t')
+                        return sql
+            
+            return data.decode('utf-8', errors='ignore').strip()
+            
+        except Exception as e:
+            self.logger.error(f"Error receiving SQL command: {e}")
+            return ""
+    
+    def _send_fake_result(self, client_socket: socket.socket, headers: List[str], rows: List[List[str]]) -> None:
+        try:
+            packet = bytearray()
+            
+            # --- COLMETADATA ---
+            packet.append(0x81)  # COLMETADATA token
+            
+            # Column count - must match exact format expected by Metasploit
+            num_columns = len(headers)
+            packet.extend(struct.pack("<H", num_columns))
+            
+            # Column definitions
+            for col_name in headers:
+                # UserType (2 bytes) and Flags (2 bytes)
+                packet.extend(b'\x00\x00\x00\x00')
+                
+                # Data type - use NVARCHAR (0xE7) for compatibility
+                packet.append(0xE7)
+                
+                # Max length (2 bytes)
+                packet.extend(struct.pack("<H", 4000))
+                
+                # Collation (5 bytes)
+                packet.extend(b'\x09\x04\xD0\x00\x34')
+                
+                # Column name length and value
+                col_name_bytes = col_name.encode('utf-16-le')
+                name_len = len(col_name)
+                if name_len > 255:  # Ensure valid length byte
+                    name_len = 255
+                packet.append(name_len)
+                packet.extend(col_name_bytes)
+            
+            # --- ROW(s) ---
+            for row_data in rows:
+                packet.append(0xD1)  # ROW token
+                
+                # For each column in the row
+                for i, value in enumerate(row_data):
+                    if i >= num_columns:  # Safety check
+                        break
+                        
+                    # For NVARCHAR, encode as UTF-16LE
+                    value_bytes = value.encode('utf-16-le')
+                    value_len = len(value_bytes)
+                    
+                    # Length prefix (2 bytes for NVARCHAR)
+                    packet.extend(struct.pack("<H", value_len))
+                    
+                    # Value
+                    packet.extend(value_bytes)
+            
+            # --- DONE ---
+            packet.append(0xFD)  # DONE token
+            packet.extend(struct.pack("<H", 0))   # Status - DONE_FINAL
+            packet.extend(struct.pack("<H", 0))   # CurCmd
+            packet.extend(struct.pack("<I", len(rows)))  # Row count (4 bytes)
+            
+            # Send the packet
+            self._send_tds_packet(client_socket, packet, 0x04)
+            
+        except Exception as e:
+            self.logger.error(f"Error sending fake result: {e}")
+
+    def _generate_fake_sql_response(self, command: str) -> Tuple[List[str], List[List[str]]]:
+        """
+        Generate appropriate responses for SQL commands based on common attack patterns
+        
+        Args:
+            command: SQL command string
+            
+        Returns:
+            Tuple of (headers, rows)
+        """
+        command_lower = command.lower().strip()
+        self.logger.debug(f"Processing SQL command: {command_lower}")
+        
+        # --- SERVER INFORMATION QUERIES ---
+        
+        # Version information
+        if "@@version" in command_lower:
+            return (
+                ["version"],
+                [["Microsoft SQL Server 2019 (RTM-CU21) - 15.0.4198.2 (X64) Enterprise Edition on Windows Server 2019 Standard 10.0 (Build 17763: ) (Hypervisor)"]]
+            )
+        
+        # Server name - exact match for Metasploit
+        elif command_lower == "select @@servername":
+            return (
+                ["@@SERVERNAME"],
+                [[self.server_name]]
+            )
+        
+        # Database listing - exact match for Metasploit format
+        elif command_lower == "select name from master..sysdatabases":
+            return (
+                ["name"],
+                [
+                    ["master"],
+                    ["tempdb"],
+                    ["model"],
+                    ["msdb"],
+                    ["finance"]
+                ]
+            )
+        
+        # Table listing - exact match for Metasploit format
+        elif "select name,id from " in command_lower and "..sysobjects where xtype = 'u'" in command_lower:
+            db_name = command_lower.split("select name,id from ")[1].split("..")[0]
+            return (
+                ["name", "id"],
+                [
+                    ["users", "1001"],
+                    ["accounts", "1002"],
+                    ["customers", "1003"],
+                    ["orders", "1004"],
+                    ["payments", "1005"]
+                ]
+            )
+        
+        # Column information - exact match for Metasploit format
+        elif "select syscolumns.name,systypes.name,syscolumns.length from " in command_lower and "syscolumns join " in command_lower:
+            # Extract table ID from the query
+            table_id = "1001"  # Default
+            if "where syscolumns.id=" in command_lower:
+                table_id = command_lower.split("where syscolumns.id=")[1].strip()
+            
+            if table_id == "1001":  # users table
+                return (
+                    ["name", "name", "length"],
+                    [
+                        ["id", "int", "4"],
+                        ["username", "varchar", "50"],
+                        ["password", "varchar", "100"],
+                        ["email", "varchar", "100"]
+                    ]
+                )
+            elif table_id == "1002":  # accounts table
+                return (
+                    ["name", "name", "length"],
+                    [
+                        ["account_id", "int", "4"],
+                        ["user_id", "int", "4"],
+                        ["balance", "decimal", "10"],
+                        ["account_type", "varchar", "20"]
+                    ]
+                )
+            else:
+                return (
+                    ["name", "name", "length"],
+                    [
+                        ["id", "int", "4"],
+                        ["name", "varchar", "50"],
+                        ["description", "varchar", "200"]
+                    ]
+                )
+        
+        # SQL Server instance info
+        elif "select serverproperty" in command_lower:
+            if "productversion" in command_lower:
+                return (["ProductVersion"], [["15.0.4198.2"]])
+            elif "edition" in command_lower:
+                return (["Edition"], [["Enterprise Edition"]])
+            elif "productlevel" in command_lower:
+                return (["ProductLevel"], [["RTM"]])
+            elif "servername" in command_lower:
+                return (["ServerName"], [[self.server_name]])
+            else:
+                return (["Value"], [["1"]])
+        
+        # Host information
+        elif "xp_msver" in command_lower:
+            return (
+                ["Index", "Name", "Internal_Value", "Character_Value"],
+                [
+                    ["1", "ProductName", "0", "Microsoft SQL Server"],
+                    ["2", "ProductVersion", "0", "15.0.4198.2"],
+                    ["3", "Language", "1033", "English (United States)"],
+                    ["4", "Platform", "0", "NT x64"],
+                    ["5", "Comments", "0", "Enterprise Edition"]
+                ]
+            )
+        
+        # Host system info
+        elif "host_name()" in command_lower or "@@hostname" in command_lower:
+            return (["host_name"], [["SQL-PROD-01"]])
+                
+        # Current user info
+        elif "current_user" in command_lower or "system_user" in command_lower or "user_name()" in command_lower:
+            return (["CurrentUser"], [["dbo"]])
+        
+        # Language settings
+        elif "@@language" in command_lower:
+            return (["Language"], [["us_english"]])
+        
+        # --- PRIVILEGE AND ROLE CHECKING ---
+        
+        # Admin role check
+        elif "is_srvrolemember" in command_lower and "sysadmin" in command_lower:
+            return (
+                ["IsSysAdmin"],
+                [["0"]]  # Return 0 to indicate non-admin (makes attacker work harder)
+            )
+        
+        # Permissions check
+        elif "has_perms_by_name" in command_lower or "has_dbaccess" in command_lower:
+            return (["Permission"], [["1"]])  # Indicate some permissions to keep attacker interested
+        
+        # User role enumeration
+        elif "select" in command_lower and "sys.server_role_members" in command_lower:
+            return (
+                ["role_principal_id", "member_principal_id"],
+                [
+                    ["3", "5"],
+                    ["3", "7"],
+                    ["4", "6"]
+                ]
+            )
+        
+        # User list
+        elif ("select" in command_lower and "sys.server_principals" in command_lower) or "sp_helplogins" in command_lower:
+            return (
+                ["name", "principal_id", "type", "type_desc", "create_date"],
+                [
+                    ["sa", "1", "S", "SQL_LOGIN", "2022-01-01"],
+                    ["NT AUTHORITY\\SYSTEM", "2", "U", "WINDOWS_LOGIN", "2022-01-01"],
+                    ["NT SERVICE\\SQLSERVERAGENT", "3", "U", "WINDOWS_LOGIN", "2022-01-01"],
+                    ["domain\\sqladmin", "4", "U", "WINDOWS_LOGIN", "2022-01-01"],
+                    ["app_user", "5", "S", "SQL_LOGIN", "2022-05-15"]
+                ]
+            )
+        
+        # Authentication mode
+        elif "select" in command_lower and "serverproperty" in command_lower and "isintegratedsecurityonly" in command_lower:
+            return (["IsIntegratedSecurityOnly"], [["0"]])  # Mixed mode auth
+        
+        # --- DATABASE ENUMERATION ---
+        
+        # More comprehensive database listing
+        elif "sys.databases" in command_lower:
+            return (
+                ["name", "database_id", "create_date", "compatibility_level", "state"],
+                [
+                    ["master", "1", "2022-01-01", "150", "0"],
+                    ["tempdb", "2", "2022-01-01", "150", "0"],
+                    ["model", "3", "2022-01-01", "150", "0"], 
+                    ["msdb", "4", "2022-01-01", "150", "0"],
+                    ["finance", "5", "2023-03-11", "150", "0"],
+                    ["hr", "6", "2023-04-22", "150", "0"],
+                    ["customer", "7", "2023-06-10", "150", "0"]
+                ]
+            )
+        
+        # Default database for the current connection
+        elif "db_name()" in command_lower:
+            return (["db_name"], [["master"]])
+        
+        # Database files
+        elif "sys.database_files" in command_lower or "sysfiles" in command_lower:
+            return (
+                ["name", "file_id", "type", "physical_name"],
+                [
+                    ["master", "1", "0", "C:\\Program Files\\Microsoft SQL Server\\MSSQL15.MSSQLSERVER\\MSSQL\\DATA\\master.mdf"],
+                    ["mastlog", "2", "1", "C:\\Program Files\\Microsoft SQL Server\\MSSQL15.MSSQLSERVER\\MSSQL\\DATA\\mastlog.ldf"]
+                ]
+            )
+        
+        # --- TABLE ENUMERATION ---
+        
+        # General sysobjects query - used in many attack scripts
+        elif "sysobjects" in command_lower:
+            return (
+                ["name", "id", "xtype", "uid"],
+                [
+                    ["users", "1001", "U", "1"],
+                    ["accounts", "1002", "U", "1"],
+                    ["customers", "1003", "U", "1"],
+                    ["orders", "1004", "U", "1"],
+                    ["payments", "1005", "U", "1"],
+                    ["employees", "1006", "U", "1"],
+                    ["audit_log", "1007", "U", "1"],
+                    ["config", "1008", "U", "1"],
+                    ["dt_addtabletocontents", "2001", "P", "1"],  # Adding stored procedures
+                    ["sp_configure", "2002", "P", "1"]
+                ]
+            )
+        
+        # Column information - critical for schema dump and data exfiltration
+        elif "information_schema.columns" in command_lower or "syscolumns" in command_lower:
+            # Provide realistic schema information to track attacker's interest
+            return (
+                ["TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH"],
+                [
+                    ["master", "dbo", "users", "id", "int", "4"],
+                    ["master", "dbo", "users", "username", "nvarchar", "50"],
+                    ["master", "dbo", "users", "password", "nvarchar", "100"],
+                    ["master", "dbo", "users", "email", "nvarchar", "100"],
+                    ["master", "dbo", "users", "created_date", "datetime", "8"],
+                    ["master", "dbo", "accounts", "account_id", "int", "4"],
+                    ["master", "dbo", "accounts", "user_id", "int", "4"],
+                    ["master", "dbo", "accounts", "balance", "decimal", "10"],
+                    ["master", "dbo", "accounts", "account_type", "nvarchar", "20"],
+                    ["master", "dbo", "employees", "employee_id", "int", "4"],
+                    ["master", "dbo", "employees", "first_name", "nvarchar", "50"],
+                    ["master", "dbo", "employees", "last_name", "nvarchar", "50"],
+                    ["master", "dbo", "employees", "salary", "decimal", "10"],
+                    ["master", "dbo", "employees", "ssn", "nvarchar", "20"]
+                ]
+            )
+        
+        # --- SYSTEM COMMANDS AND EXTENDED PROCEDURES ---
+        
+        # xp_cmdshell - commonly used for command execution
+        elif "xp_cmdshell" in command_lower:
+            if "dir" in command_lower or "ls" in command_lower:
+                return (
+                    ["output"],
+                    [
+                        [" Volume in drive C has no label."],
+                        [" Volume Serial Number is 1234-5678"],
+                        [""],
+                        [" Directory of C:\\Program Files\\Microsoft SQL Server\\MSSQL15.MSSQLSERVER\\MSSQL"],
+                        [""],
+                        ["01/01/2022  08:00 AM    <DIR>          DATA"],
+                        ["01/01/2022  08:00 AM    <DIR>          Backup"],
+                        ["01/01/2022  08:00 AM    <DIR>          Log"],
+                        ["               0 File(s)              0 bytes"],
+                        ["               3 Dir(s)  50,123,294,720 bytes free"]
+                    ]
+                )
+            elif "whoami" in command_lower:
+                return (["output"], [["nt service\\mssqlserver"]])
+            elif "ipconfig" in command_lower:
+                return (
+                    ["output"],
+                    [
+                        ["Windows IP Configuration"],
+                        [""],
+                        ["Ethernet adapter Ethernet:"],
+                        [""],
+                        ["   Connection-specific DNS Suffix  . : domain.local"],
+                        ["   IPv4 Address. . . . . . . . . . . : 10.0.0.25"],
+                        ["   Subnet Mask . . . . . . . . . . . : 255.255.255.0"],
+                        ["   Default Gateway . . . . . . . . . : 10.0.0.1"]
+                    ]
+                )
+            else:
+                return (
+                    ["output"],
+                    [["Access denied. The xp_cmdshell procedure is disabled on this server."]]
+                )
+        
+        # xp_dirtree - used for UNC path injection and SMB hash capture
+        elif "xp_dirtree" in command_lower:
+            if "\\\\evil" in command_lower or "\\\\10." in command_lower or "\\\\192." in command_lower:
+                # Track potential UNC path injection attempts
+                self.logger.warning(f"Possible UNC path injection attempt: {command}")
+                return (["subdirectory", "depth", "is_file"], [])  # Empty result
+            else:
+                return (
+                    ["subdirectory", "depth", "is_file"],
+                    [
+                        ["Program Files", "1", "0"],
+                        ["Windows", "1", "0"],
+                        ["Users", "1", "0"],
+                        ["temp", "1", "0"]
+                    ]
+                )
+        
+        # Other common extended procedures
+        elif "xp_regread" in command_lower:
+            return (["Value"], [["0"]])
+        elif "sp_oacreate" in command_lower:
+            return (["Return Value"], [["0"]])
+        elif "sp_configure" in command_lower:
+            if "show advanced" in command_lower:
+                return (
+                    ["name", "minimum", "maximum", "config_value", "run_value"],
+                    [
+                        ["xp_cmdshell", "0", "1", "0", "0"],
+                        ["remote access", "0", "1", "1", "1"],
+                        ["allow updates", "0", "1", "0", "0"],
+                        ["max text repl size", "0", "2147483647", "65536", "65536"]
+                    ]
+                )
+            else:
+                return (["Value"], [["0"]])
+        
+        # --- DATA QUERIES ---
+        
+        # Common table queries - simulate sensitive data to log attackers' intent
+        elif "from users" in command_lower:
+            return (
+                ["id", "username", "password", "email", "created_date"],
+                [
+                    ["1", "admin", "hashed_password_1", "admin@example.com", "2022-01-01"],
+                    ["2", "jsmith", "hashed_password_2", "jsmith@example.com", "2022-02-15"],
+                    ["3", "mjones", "hashed_password_3", "mjones@example.com", "2022-03-22"],
+                    ["4", "dkim", "hashed_password_4", "dkim@example.com", "2022-05-10"]
+                ]
+            )
+        elif "from employees" in command_lower:
+            return (
+                ["employee_id", "first_name", "last_name", "hire_date", "salary"],
+                [
+                    ["1", "John", "Smith", "2020-06-15", "75000.00"],
+                    ["2", "Mary", "Jones", "2019-03-22", "82000.00"],
+                    ["3", "David", "Kim", "2021-11-10", "65000.00"],
+                    ["4", "Sarah", "Lee", "2018-08-05", "92000.00"]
+                ]
+            )
+        elif "from accounts" in command_lower:
+            return (
+                ["account_id", "user_id", "balance", "account_type", "created_date"],
+                [
+                    ["1001", "1", "25000.00", "checking", "2022-01-05"],
+                    ["1002", "1", "100000.00", "savings", "2022-01-05"],
+                    ["1003", "2", "5250.75", "checking", "2022-02-20"],
+                    ["1004", "3", "12750.25", "checking", "2022-04-01"]
+                ]
+            )
+        
+        # --- SQLMAP AND INJECTION TESTING ---
+        
+        # SQLMap detection and information queries
+        elif any(marker in command_lower for marker in ["@@payload", "sqlmap", "waitfor delay", "sleep(", "benchmark("]):
+            self.logger.warning(f"Possible SQL injection attack detected: {command}")
+            return (["result"], [["Query processed. No results to display."]])
+        
+        # Error-based injection test
+        elif any(marker in command_lower for marker in ["convert(", "cast(", "db_name(", "concat(", "error"]):
+            return (["Error"], [["Incorrect syntax near the keyword."]])
+        
+        # Union-based injection fingerprinting
+        elif "union" in command_lower and "select" in command_lower:
+            self.logger.warning(f"Possible UNION-based SQL injection attempt: {command}")
+            return (["Error"], [["All queries in a SQL statement containing a UNION operator must have an equal number of expressions."]])
+        
+        # Login failed count - specifically for Metasploit login scanners
+        elif "select" in command_lower and "count" in command_lower and "login failed" in command_lower:
+            return (["count"], [["15"]])
+        
+        # --- DEFAULT FALLBACKS ---
+        
+        # Generic SELECT query response
+        elif "select" in command_lower:
+            return (
+                ["result"],
+                [["Query processed. 0 rows affected."]]
+            )
+        
+        # Generic UPDATE/INSERT/DELETE response
+        elif any(op in command_lower for op in ["update ", "insert ", "delete "]):
+            return (
+                ["result"],
+                [["Command completed. 0 rows affected."]]
+            )
+        
+        # Generic error for invalid commands
+        else:
+            return (
+                ["result"],
+                [["Command executed successfully."]]
+            )
+        
