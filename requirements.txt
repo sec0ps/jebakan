@@ -1,35 +1,22 @@
-# Core packages
-paramiko>=2.7.2       # SSH protocol for the SSH honeypot
-requests>=2.25.1      # HTTP client for webhooks and notifications
-matplotlib>=3.5.1     # Data visualization for analytics
-ipaddress>=1.0.23     # IP address manipulation utilities
+# Core dependencies
+requests>=2.27.1
+colorama>=0.4.4
+packaging>=21.3
+paramiko>=2.9.0
+geoip2>=4.5.0
 
-# Logging and monitoring
-python-json-logger>=2.0.1  # JSON-formatted logging
-colorlog>=6.6.0           # Colored console logging
+# Machine learning dependencies
+numpy>=1.22.0
+pandas>=1.4.0
+scikit-learn>=1.0.2
+joblib>=1.1.0
 
-# Database
-SQLAlchemy>=1.4.31       # ORM for database operations (optional alternative to SQLite)
+# Database and data handling
+sqlalchemy>=1.4.0
 
-# Email notifications
-secure-smtplib>=0.1.1    # Secure SMTP client for email alerts
+# Optional visualization (if needed)
+matplotlib>=3.5.0
+seaborn>=0.11.2
 
-# Web dashboard dependencies
-Jinja2>=3.0.3           # Templating engine for dashboard
-pillow>=9.0.1           # Image processing for dashboard charts
-
-# Security
-bcrypt>=3.2.0           # Password hashing for dashboard authentication
-cryptography>=36.0.1    # Cryptographic primitives
-
-# Testing
-pytest>=7.0.0           # Testing framework
-pytest-cov>=3.0.0       # Coverage reports
-
-# Development tools
-black>=22.1.0           # Code formatter
-flake8>=4.0.1           # Linter
-mypy>=0.931             # Static type checking
-
-#GeoIP Database
-geoip2
+# Other service dependencies
+python-dateutil>=2.8.2
