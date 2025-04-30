@@ -48,21 +48,25 @@ from services.base_service import BaseService
 class DockerService(BaseService):
     """Docker API service emulator for the honeypot"""
 
-    def __init__(self, host: str, port: int, config: Dict[str, Any]):
+    def __init__(self, host: str, port: int, config: Dict[str, Any], unified_logger=None):
         """
         Initialize the Docker API service
-
+    
         Args:
             host: Host IP to bind to
             port: Port to listen on
             config: Global configuration dictionary
+            unified_logger: Unified logger instance for centralized logging
         """
         super().__init__(host, port, config, "docker")
-
+        
+        # Store unified logger instance
+        self.unified_logger = unified_logger
+    
         # Docker API specific configurations
         self.api_version = self.service_config.get("api_version", "1.41")
         self.docker_version = self.service_config.get("docker_version", "20.10.7")
-
+    
         # Fake container data
         self.containers = self._generate_fake_containers()
         self.images = self._generate_fake_images()
@@ -181,75 +185,106 @@ class DockerService(BaseService):
                      connection_data: Dict[str, Any]) -> None:
         """
         Handle a client connection to the Docker API service
-
+    
         Args:
             client_socket: Client socket object
             address: Client address tuple (ip, port)
             connection_data: Dictionary to store connection data for logging
         """
         connection_data["data"]["connection_time"] = datetime.datetime.now().isoformat()
-
+    
+        # Log connection attempt to unified logger
+        if self.unified_logger:
+            self.unified_logger.log_attack(
+                service="docker",
+                attacker_ip=address[0],
+                attacker_port=address[1],
+                command="connection_attempt",
+                additional_data={"timestamp": datetime.datetime.now().isoformat()}
+            )
+    
         # Track API calls for this session
         api_calls = []
-
+    
         try:
             self.logger.info(f"Docker API connection from {address[0]}:{address[1]}")
-
+    
             while True:
                 # Docker API uses HTTP, so receive until we get a complete HTTP request
                 request_data = b""
                 content_length = 0
                 headers_done = False
-
+    
                 while True:
                     chunk = client_socket.recv(4096)
                     if not chunk:
                         return
-
+    
                     request_data += chunk
-
+    
                     # Check if we've received headers
                     if not headers_done and b"\r\n\r\n" in request_data:
                         headers, body = request_data.split(b"\r\n\r\n", 1)
                         headers_done = True
-
+    
                         # Extract Content-Length
                         match = re.search(rb"Content-Length: (\d+)", headers)
                         if match:
                             content_length = int(match.group(1))
-
+    
                     # If we have headers and the complete body, break
                     if headers_done and len(body) >= content_length:
                         break
-
+    
                 if not request_data:
                     break
-
+    
                 # Process HTTP request to Docker API
                 http_request = request_data.decode('utf-8', errors='ignore')
-                response, api_call_info = self._process_docker_api_request(http_request)
-
+                response, api_call_info = self._process_docker_api_request(http_request, address)
+    
                 # Log API call
                 if api_call_info:
                     api_calls.append(api_call_info)
                     connection_data["data"]["api_calls"] = api_calls
-
+    
+                    # Log API call to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="docker",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command=f"docker_api_call_{api_call_info['method']}_{api_call_info['endpoint']}",
+                            additional_data=api_call_info
+                        )
+    
                 # Send response
                 client_socket.send(response.encode())
-
+    
         except Exception as e:
             self.logger.error(f"Error handling Docker API client: {e}")
             connection_data["error"] = str(e)
+            
+            # Log error to unified logger
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="docker",
+                    attacker_ip=address[0],
+                    attacker_port=address[1],
+                    command="error",
+                    additional_data={"error": str(e)}
+                )
         finally:
             client_socket.close()
 
-    def _process_docker_api_request(self, request: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+    def _process_docker_api_request(self, request: str, address: Tuple[str, int]) -> Tuple[str, Optional[Dict[str, Any]]]:
         """
         Process HTTP request to Docker API
-
+    
         Args:
             request: Raw HTTP request
-
+            address: Client address tuple (ip, port)
+    
         Returns:
             Tuple of (HTTP response, API call info dict or None)
         """
@@ -257,14 +292,14 @@ class DockerService(BaseService):
         request_lines = request.strip().split('\r\n')
         if not request_lines:
             return self._generate_error_response(400, "Bad Request"), None
-
+    
         # Parse request line
         request_line = request_lines[0].split()
         if len(request_line) < 3:
             return self._generate_error_response(400, "Bad Request"), None
-
+    
         method, path, _ = request_line
-
+    
         # Extract headers
         headers = {}
         i = 1
@@ -273,47 +308,76 @@ class DockerService(BaseService):
                 key, value = request_lines[i].split(': ', 1)
                 headers[key.lower()] = value
             i += 1
-
+    
         # Extract body if present
         body = ""
         if i < len(request_lines) - 1:
             body = '\r\n'.join(request_lines[i+1:])
-
+    
+        # Determine endpoint name for logging
+        endpoint = "unknown"
+        if path == "/v1.41/version" or path == "/version":
+            endpoint = "version"
+        elif path == "/v1.41/info" or path == "/info":
+            endpoint = "info"
+        elif path == "/v1.41/containers/json" or path == "/containers/json":
+            endpoint = "list_containers"
+        elif path == "/v1.41/images/json" or path == "/images/json":
+            endpoint = "list_images"
+        elif re.match(r"/v1\.41/containers/create", path) or re.match(r"/containers/create", path):
+            endpoint = "create_container"
+        elif re.match(r"/v1\.41/containers/([a-zA-Z0-9]+)/start", path) or re.match(r"/containers/([a-zA-Z0-9]+)/start", path):
+            endpoint = "start_container"
+        elif re.match(r"/v1\.41/containers/([a-zA-Z0-9]+)/stop", path) or re.match(r"/containers/([a-zA-Z0-9]+)/stop", path):
+            endpoint = "stop_container"
+        elif re.match(r"/v1\.41/containers/([a-zA-Z0-9]+)/exec", path) or re.match(r"/containers/([a-zA-Z0-9]+)/exec", path):
+            endpoint = "exec_container"
+    
         # Log the request
         api_call_info = {
             "method": method,
             "path": path,
+            "endpoint": endpoint,
             "body": body,
             "timestamp": datetime.datetime.now().isoformat()
         }
-
+    
         self.logger.info(f"Docker API request: {method} {path}")
-
+    
         # Handle different endpoints
         if path == "/v1.41/version" or path == "/version":
-            return self._handle_version(), api_call_info
+            return self._handle_version(address), api_call_info
         elif path == "/v1.41/info" or path == "/info":
-            return self._handle_info(), api_call_info
+            return self._handle_info(address), api_call_info
         elif path == "/v1.41/containers/json" or path == "/containers/json":
-            return self._handle_list_containers(), api_call_info
+            return self._handle_list_containers(address), api_call_info
         elif path == "/v1.41/images/json" or path == "/images/json":
-            return self._handle_list_images(), api_call_info
+            return self._handle_list_images(address), api_call_info
         elif re.match(r"/v1\.41/containers/create", path) or re.match(r"/containers/create", path):
-            return self._handle_create_container(body), api_call_info
+            return self._handle_create_container(body, address), api_call_info
         elif re.match(r"/v1\.41/containers/([a-zA-Z0-9]+)/start", path) or re.match(r"/containers/([a-zA-Z0-9]+)/start", path):
             container_id = re.match(r".*containers/([a-zA-Z0-9]+)/start", path).group(1)
-            return self._handle_start_container(container_id), api_call_info
+            return self._handle_start_container(container_id, address), api_call_info
         elif re.match(r"/v1\.41/containers/([a-zA-Z0-9]+)/stop", path) or re.match(r"/containers/([a-zA-Z0-9]+)/stop", path):
             container_id = re.match(r".*containers/([a-zA-Z0-9]+)/stop", path).group(1)
-            return self._handle_stop_container(container_id), api_call_info
+            return self._handle_stop_container(container_id, address), api_call_info
         elif re.match(r"/v1\.41/containers/([a-zA-Z0-9]+)/exec", path) or re.match(r"/containers/([a-zA-Z0-9]+)/exec", path):
             container_id = re.match(r".*containers/([a-zA-Z0-9]+)/exec", path).group(1)
-            return self._handle_exec_container(container_id, body), api_call_info
+            return self._handle_exec_container(container_id, body, address), api_call_info
         else:
             return self._generate_error_response(404, "Not Found"), api_call_info
 
-    def _handle_version(self) -> str:
+    def _handle_version(self, address: Tuple[str, int]) -> str:
         """Handle version endpoint"""
+        if self.unified_logger:
+            self.unified_logger.log_attack(
+                service="docker",
+                attacker_ip=address[0],
+                attacker_port=address[1],
+                command="docker_api_version",
+                additional_data={"version": self.docker_version, "api_version": self.api_version}
+            )
+            
         response_body = json.dumps({
             "Version": self.docker_version,
             "ApiVersion": self.api_version,
@@ -325,7 +389,7 @@ class DockerService(BaseService):
             "KernelVersion": "5.4.0-74-generic",
             "BuildTime": "2021-05-12T21:19:41.000000000+00:00"
         })
-
+    
         return self._generate_http_response(200, "OK", response_body)
 
     def _handle_info(self) -> str:
@@ -419,37 +483,57 @@ class DockerService(BaseService):
         """Handle list images endpoint"""
         return self._generate_http_response(200, "OK", json.dumps(self.images))
 
-    def _handle_create_container(self, body: str) -> str:
+    def _handle_create_container(self, body: str, address: Tuple[str, int]) -> str:
         """Handle create container endpoint"""
         self.logger.warning(f"Attempt to create container with: {body}")
-
+    
         try:
             # Try to parse the container creation request
             container_config = json.loads(body)
-
-            # Log what image they're trying to run - could indicate attack type
-            if "Image" in container_config:
-                self.logger.warning(f"Attempt to create container with image: {container_config['Image']}")
-
-            # Log any commands specified
-            if "Cmd" in container_config:
-                self.logger.warning(f"Container creation command: {container_config['Cmd']}")
-
-            # Check for potentially malicious mounts
+    
+            # Extract key details for logging
+            image = container_config.get("Image", "unknown")
+            cmd = container_config.get("Cmd", [])
+            binds = []
+            
             if "HostConfig" in container_config and "Binds" in container_config["HostConfig"]:
-                for bind in container_config["HostConfig"]["Binds"]:
+                binds = container_config["HostConfig"]["Binds"]
+                for bind in binds:
                     self.logger.warning(f"Container bind mount: {bind}")
-
+            
+            # Log to unified logger
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="docker",
+                    attacker_ip=address[0],
+                    attacker_port=address[1],
+                    command="docker_create_container",
+                    additional_data={
+                        "image": image,
+                        "cmd": cmd,
+                        "binds": binds,
+                        "full_config": container_config
+                    }
+                )
+    
             # Return success with fake container ID
             container_id = str(uuid.uuid4()).replace("-", "")[:12]
             response_body = json.dumps({
                 "Id": container_id,
                 "Warnings": []
             })
-
+    
             return self._generate_http_response(201, "Created", response_body)
-
+    
         except json.JSONDecodeError:
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="docker",
+                    attacker_ip=address[0],
+                    attacker_port=address[1],
+                    command="docker_create_container_error",
+                    additional_data={"error": "Invalid JSON", "body": body}
+                )
             return self._generate_error_response(400, "Invalid JSON")
 
     def _handle_start_container(self, container_id: str) -> str:
@@ -466,27 +550,50 @@ class DockerService(BaseService):
         # Always return success in honeypot
         return self._generate_http_response(204, "No Content", "")
 
-    def _handle_exec_container(self, container_id: str, body: str) -> str:
+    def _handle_exec_container(self, container_id: str, body: str, address: Tuple[str, int]) -> str:
         """Handle exec in container endpoint"""
         self.logger.warning(f"Attempt to exec in container with ID: {container_id}")
-
+    
         try:
             # Try to parse the exec request
             exec_config = json.loads(body)
-
+    
             # Log what command they're trying to run
-            if "Cmd" in exec_config:
-                self.logger.warning(f"Exec command: {exec_config['Cmd']}")
-
+            cmd = exec_config.get("Cmd", [])
+            if cmd:
+                self.logger.warning(f"Exec command: {cmd}")
+                
+            # Log to unified logger
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="docker",
+                    attacker_ip=address[0],
+                    attacker_port=address[1],
+                    command="docker_exec_container",
+                    additional_data={
+                        "container_id": container_id,
+                        "cmd": cmd,
+                        "full_config": exec_config
+                    }
+                )
+    
             # Return success with fake exec ID
             exec_id = str(uuid.uuid4()).replace("-", "")[:12]
             response_body = json.dumps({
                 "Id": exec_id
             })
-
+    
             return self._generate_http_response(201, "Created", response_body)
-
+    
         except json.JSONDecodeError:
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="docker",
+                    attacker_ip=address[0],
+                    attacker_port=address[1],
+                    command="docker_exec_container_error",
+                    additional_data={"error": "Invalid JSON", "container_id": container_id, "body": body}
+                )
             return self._generate_error_response(400, "Invalid JSON")
 
     def _generate_http_response(self, status_code: int, status_text: str, body: str) -> str:
@@ -512,3 +619,76 @@ class DockerService(BaseService):
         })
 
         return self._generate_http_response(status_code, error_message, body)
+    
+    def start(self) -> None:
+        """Start the Docker API service"""
+        try:
+            self.sock.bind((self.host, self.port))
+            self.sock.listen(5)
+            self.running = True
+            
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="docker",
+                    attacker_ip="system",
+                    attacker_port=0,
+                    command="service_start",
+                    additional_data={"port": self.port}
+                )
+            
+            self.logger.info(f"Docker API honeypot started on port {self.port}")
+            
+            while self.running:
+                try:
+                    client, addr = self.sock.accept()
+                    
+                    # Set a timeout for the client socket
+                    client.settimeout(self.config["resource_limits"]["connection_timeout"])
+                    
+                    # Check if we've reached the maximum connections
+                    if self.connection_count >= self.config["network"]["max_connections"]:
+                        self.logger.warning(f"Maximum connections reached, dropping connection from {addr[0]}")
+                        client.close()
+                        continue
+                    
+                    # Increment connection counters
+                    self.connection_count += 1
+                    self._increment_ip_counter(addr[0])
+                    
+                    # Log the connection
+                    self.logger.info(f"Connection from {addr[0]}:{addr[1]} to Docker API service")
+                    
+                    # Start a new thread to handle the client
+                    client_handler = threading.Thread(
+                        target=self._handle_client_wrapper,
+                        args=(client, addr)
+                    )
+                    client_handler.daemon = True
+                    client_handler.start()
+                    
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="docker",
+                            attacker_ip="error",
+                            attacker_port=0,
+                            command="error",
+                            additional_data={"error": str(e)}
+                        )
+                    self.logger.error(f"Error accepting connection: {e}")
+                    
+        except Exception as e:
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="docker",
+                    attacker_ip="error",
+                    attacker_port=0,
+                    command="service_error",
+                    additional_data={"error": str(e)}
+                )
+            self.logger.error(f"Error starting Docker API service: {e}")
+        finally:
+            if self.sock:
+                self.sock.close()
