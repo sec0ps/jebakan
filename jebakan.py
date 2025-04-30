@@ -779,7 +779,7 @@ class UnifiedLogger:
         attack_data = self._collect_attack_data()
         
         if len(attack_data) < 10:
-            self.logger.warning("Not enough data to train anomaly model (need at least 10 samples)")
+            self.ml_logger.warning("Not enough data to train anomaly model (need at least 10 samples)")
             return None
         
         try:
@@ -1879,7 +1879,7 @@ def print_status(started_services, dashboard_port=None, analytics_enabled=False)
     print(f"{Style.RESET_ALL}")
 
 def check_for_updates():
-    """Check if a newer version is available and force update if needed"""
+    """Check if a newer version is available, force update if needed, and exit after update"""
     current_version_file = os.path.join(os.path.dirname(__file__), 'version.txt')
     if not os.path.isfile(current_version_file):
         print("Version file not found.")
@@ -1893,7 +1893,6 @@ def check_for_updates():
         if response.status_code == 200:
             latest_version = response.text.strip()
 
-            # Compare strictly
             if latest_version != current_version:
                 print(f"Update available: {latest_version} (current: {current_version})")
                 print("Pulling latest changes from GitHub...")
@@ -1903,19 +1902,24 @@ def check_for_updates():
                     subprocess.run(["git", "clean", "-fd"], check=True)
                     subprocess.run(["git", "pull"], check=True)
 
-                    # Update local version.txt
+                    # Update version file
                     with open(current_version_file, 'w') as f:
                         f.write(latest_version + "\n")
 
                     print("Update completed successfully.")
+                    logger.info("Jebakan has updated to version %s and will now exit.", latest_version)
+                    sys.exit(0)
                 except subprocess.CalledProcessError as e:
                     print(f"Git update failed: {e}")
+                    logger.error("Update failed: %s", str(e))
+                    sys.exit(1)
             else:
                 print("Jebakan is up to date.")
         else:
-            print("Failed to check for updates (HTTP status {}).".format(response.status_code))
+            print(f"Failed to check for updates (HTTP status {response.status_code}).")
     except Exception as e:
         print(f"Update check error: {e}")
+        logger.warning("Update check failed: %s", str(e))
 
 def force_git_update():
     try:
