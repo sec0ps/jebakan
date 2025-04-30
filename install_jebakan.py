@@ -156,7 +156,7 @@ def create_user_and_group():
                        "-r",                      # System account
                        "-g", GROUP_NAME,          # Primary group
                        "-d", "/opt/jebakan",      # Home directory
-                       "-s", "/bin/false",        # No login shell
+                       "-s", "/bin/bash",        # BASH Shell
                        "-c", "Honeypot Service",  # Comment
                        USER_NAME], check=True)
         logger.info(f"User {USER_NAME} created with home directory at /opt/jebakan")
