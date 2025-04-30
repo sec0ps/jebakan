@@ -49,6 +49,10 @@ from typing import Dict, Any, Tuple, Optional
 import colorama
 from colorama import Fore, Style, init
 
+VERSION_FILE = os.path.join(base_dir, "version.txt")
+REMOTE_VERSION_URL = "https://raw.githubusercontent.com/sec0ps/jebakan/main/version.txt"
+
+
 base_dir = "/opt/jebakan"
 
 pid_dir = os.path.join(base_dir, "config")
@@ -1453,8 +1457,46 @@ def print_status(started_services, dashboard_port=None, analytics_enabled=False)
     print(f"\n{Fore.YELLOW}Press Ctrl+C to stop the honeypot.")
     print(f"{Style.RESET_ALL}")
 
+def check_for_updates():
+    """Check for new version and perform git pull if needed."""
+    try:
+        if not os.path.exists(VERSION_FILE):
+            print(f"{Fore.RED}Local version file not found at {VERSION_FILE}")
+            return
+
+        with open(VERSION_FILE, 'r') as f:
+            local_version = f.read().strip()
+
+        resp = requests.get(REMOTE_VERSION_URL, timeout=5)
+        if resp.status_code != 200:
+            print(f"{Fore.YELLOW}Unable to fetch remote version info.")
+            return
+
+        remote_version = resp.text.strip()
+
+        if version.parse(remote_version) > version.parse(local_version):
+            print(f"{Fore.YELLOW}Update available: {remote_version} (current: {local_version})")
+            print(f"{Fore.CYAN}Pulling latest changes from GitHub...")
+
+            result = subprocess.run(["git", "pull"], cwd=base_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            if result.returncode == 0:
+                print(f"{Fore.GREEN}Update pulled successfully. Please restart the honeypot.")
+            else:
+                print(f"{Fore.RED}Git pull failed:\n{result.stderr}")
+
+            sys.exit(0)
+
+        else:
+            print(f"{Fore.GREEN}You are running the latest version ({local_version}).")
+
+    except Exception as e:
+        print(f"{Fore.RED}Auto-update failed: {e}")
+
 def main():
     global logger, running
+    
+    check_for_updates()
 
     parser = argparse.ArgumentParser(description="Python Honeypot System")
     parser.add_argument("-c", "--config", help="Path to configuration file", default="config/honeypot.json")
