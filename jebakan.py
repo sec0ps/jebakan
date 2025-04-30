@@ -41,19 +41,26 @@ import signal
 import sys
 import re
 import copy
+import joblib
+import requests
 import geoip2.database
 import subprocess
 from packaging import version
-import requests
-from typing import Dict, Any, Tuple, Optional
-import colorama
+from collections import defaultdict, Counter
+from typing import Dict, List, Any, Tuple, Optional
 from colorama import Fore, Style, init
+
+####### ML Added libraries #######
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.cluster import DBSCAN
+
+base_dir = "/opt/jebakan"
 
 VERSION_FILE = os.path.join(base_dir, "version.txt")
 REMOTE_VERSION_URL = "https://raw.githubusercontent.com/sec0ps/jebakan/main/version.txt"
-
-
-base_dir = "/opt/jebakan"
 
 pid_dir = os.path.join(base_dir, "config")
 if not os.path.exists(pid_dir):
@@ -140,6 +147,7 @@ def cleanup_services(active_services):
     
     print(f"{Fore.YELLOW}Cleaning up services and releasing ports...{Style.RESET_ALL}")
     
+    # Original service cleanup code
     for service_name, service_obj, thread in active_services:
         try:
             # Stop the service if it has a stop method
@@ -225,7 +233,7 @@ class UnifiedLogger:
                 self.logger.info("GeoIP database loaded successfully.")
             except Exception as e:
                 self.logger.error(f"Failed to load GeoIP database: {e}")
-
+    
         if self.siem_config:
             # Start with a connection test
             self._check_siem_connection()
@@ -235,9 +243,62 @@ class UnifiedLogger:
             self.siem_sender.start()
             self.logger.info(f"SIEM logging enabled to {self.siem_config['ip_address']}:{self.siem_config['port']}")
     
+        # ML-specific attributes
+        self.ml_enabled = config.get("analytics", {}).get("enabled", True)
+        if self.ml_enabled:
+            # Set up ML-specific logging
+            self.ml_logger = logging.getLogger("ml_system")
+            self.ml_logger.setLevel(logging.INFO)
+            
+            # Create file handler for ML logs
+            ml_log_path = os.path.join(self.log_dir, "ml_system.log")
+            ml_file_handler = logging.FileHandler(ml_log_path)
+            ml_file_handler.setLevel(logging.INFO)
+            
+            # Create formatter
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            ml_file_handler.setFormatter(formatter)
+            
+            # Add the handler to the ML logger
+            self.ml_logger.addHandler(ml_file_handler)
+            
+            # Make the ML logger propagate=False to prevent logs from going to root logger
+            self.ml_logger.propagate = False
+            
+            self.ml_logger.info("ML logging system initialized")
+            
+            # Initialize ML resources
+            self.ip_features_cache = {}
+            self.attacker_profiles = {}
+            
+            # ML model storage
+            self.models_dir = os.path.join(os.path.dirname(self.log_dir), "models")
+            os.makedirs(self.models_dir, exist_ok=True)
+            
+            # Load or train initial models
+            self.anomaly_model = self._load_model("anomaly_model.pkl") or self._train_anomaly_model()
+            self.risk_model = self._load_model("risk_model.pkl") or self._train_risk_model()
+            
+            # Start background thread for model updates
+            self.last_model_update = 0
+            self.model_update_interval = 3600  # Update models every hour
+            self.ml_update_thread = threading.Thread(target=self._ml_model_update_loop, daemon=True)
+            self.ml_update_thread.start()
+            
+            self.ml_logger.info("ML capabilities initialized in self.ml_logger")
+
     def log_attack(self, service: str, attacker_ip: str, attacker_port: int, 
                    command: str, additional_data: Dict[str, Any] = None) -> None:
-        """Log an attack to the unified log file"""
+        """
+        Log an attack to the unified log file with ML risk analysis
+        
+        Args:
+            service: Service that was attacked
+            attacker_ip: Attacker's IP address
+            attacker_port: Attacker's port
+            command: Command or action performed
+            additional_data: Additional attack data
+        """
         log_entry = {
             "timestamp": datetime.datetime.now().isoformat(),
             "service": service,
@@ -245,7 +306,7 @@ class UnifiedLogger:
             "attacker_port": attacker_port,
             "command": command
         }
-
+    
         # Add geolocation enrichment
         if self.geoip_reader:
             try:
@@ -259,14 +320,59 @@ class UnifiedLogger:
                 log_entry["geolocation"] = {k: v for k, v in geo_info.items() if v}
             except Exception:
                 log_entry["geolocation"] = {}
-
+    
         # Add additional data if provided
         if additional_data:
             log_entry["additional_data"] = additional_data
-
+    
         # Write to unified log file
         with open(self.unified_log_file, 'a') as f:
             f.write(json.dumps(log_entry) + "\n")
+        
+        # Add ML processing code here
+        if hasattr(self, 'ml_enabled') and self.ml_enabled:
+            try:
+                # Process with ML
+                attack_data = {
+                    "service": service,
+                    "attacker_ip": attacker_ip,
+                    "attacker_port": attacker_port,
+                    "command": command,
+                    "additional_data": additional_data or {},
+                    "timestamp": datetime.datetime.now().isoformat()
+                }
+                
+                # Extract features and calculate risk score
+                features = self._extract_features(attack_data)
+                risk_score = self._calculate_risk_score(features)
+                
+                # Check for anomalies
+                is_anomaly, anomaly_score = self._detect_anomalies(features)
+                
+                # Add ML results to the log entry
+                ml_entry = {
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "attack_data": attack_data,
+                    "risk_score": float(risk_score),  # Ensure it's a float
+                    "is_anomaly": int(is_anomaly),    # Convert bool to int
+                    "anomaly_score": float(anomaly_score)  # Ensure it's a float
+                }
+                
+                # Log high-risk or anomalous events
+                if risk_score > 0.7 or is_anomaly:
+                    self.ml_logger.warning(
+                        f"High-risk attack detected from {attacker_ip} - "
+                        f"Risk: {risk_score:.2f}, "
+                        f"Anomaly: {is_anomaly}, Score: {anomaly_score:.2f}"
+                    )
+                    
+                    # Write to a separate ML insights file
+                    ml_log_file = os.path.join(self.log_dir, "ml_insights.json")
+                    with open(ml_log_file, 'a') as f:
+                        f.write(json.dumps(ml_entry) + "\n")
+                    
+            except Exception as e:
+                self.ml_logger.error(f"Error in ML processing: {e}")
     
     def _load_last_position(self) -> int:
         """Load the last position sent to SIEM from file"""
@@ -465,6 +571,331 @@ class UnifiedLogger:
                 
             return False
 
+    def _extract_features(self, attack_data: Dict[str, Any]) -> Dict[str, float]:
+        """Extract features from attack data for ML processing"""
+        features = {}
+        
+        # Source IP metadata
+        attacker_ip = attack_data.get("attacker_ip", "")
+        if attacker_ip in self.ip_features_cache:
+            # Update cached features with new attack data
+            cached = self.ip_features_cache[attacker_ip]
+            cached["attack_count"] += 1
+            cached["last_seen"] = time.time()
+            
+            # Calculate time since first seen
+            time_active = cached["last_seen"] - cached["first_seen"]
+            cached["attacks_per_hour"] = (cached["attack_count"] / time_active) * 3600 if time_active > 0 else 0
+            
+            # Record service attacked
+            service = attack_data.get("service", "unknown")
+            cached["services_attacked"].add(service)
+            cached["service_count"] = len(cached["services_attacked"])
+            
+            # Record command if present
+            command = attack_data.get("command", "")
+            if command:
+                cached["commands"].append(command)
+            
+            # Extract and store features from cache
+            features["attack_count"] = cached["attack_count"]
+            features["time_active_seconds"] = time_active
+            features["attacks_per_hour"] = cached["attacks_per_hour"]
+            features["service_count"] = cached["service_count"]
+            features["unique_commands"] = len(set(cached["commands"]))
+            features["command_count"] = len(cached["commands"])
+        else:
+            # Initialize cache for new IP
+            self.ip_features_cache[attacker_ip] = {
+                "attack_count": 1,
+                "first_seen": time.time(),
+                "last_seen": time.time(),
+                "attacks_per_hour": 0,
+                "services_attacked": {attack_data.get("service", "unknown")},
+                "service_count": 1,
+                "commands": [attack_data.get("command", "")]
+            }
+            
+            # Set initial features
+            features["attack_count"] = 1
+            features["time_active_seconds"] = 0
+            features["attacks_per_hour"] = 0
+            features["service_count"] = 1
+            features["unique_commands"] = 1 if attack_data.get("command") else 0
+            features["command_count"] = 1 if attack_data.get("command") else 0
+        
+        # Service-specific features
+        service = attack_data.get("service", "unknown")
+        command = attack_data.get("command", "")
+        
+        # Common malicious indicators
+        malicious_indicators = [
+            "wget", "curl", "chmod", "base64", "eval", "bash", "sh ", 
+            "nc ", "ncat", "reverse shell", "cat /etc/passwd", "cat /etc/shadow"
+        ]
+        
+        # Check for malicious indicators in command
+        features["malicious_indicator_count"] = sum(1 for ind in malicious_indicators if ind in command.lower())
+        
+        # Check for login attempts
+        if "login_attempt" in command or command == "login_attempt":
+            features["login_attempt"] = 1
+            
+            # Extract credentials if available
+            additional_data = attack_data.get("additional_data", {})
+            username = additional_data.get("username", "")
+            password = additional_data.get("password", "")
+            
+            # Features based on username/password
+            features["username_length"] = len(username) if username else 0
+            features["password_length"] = len(password) if password else 0
+            features["has_special_chars"] = 1 if any(c in r'!@#$%^&*()_+-=[]{};\:"|<>?,./' for c in password) else 0
+        else:
+            features["login_attempt"] = 0
+            features["username_length"] = 0
+            features["password_length"] = 0
+            features["has_special_chars"] = 0
+        
+        # Service-specific features
+        if service == "ssh":
+            features["ssh_attack"] = 1
+        else:
+            features["ssh_attack"] = 0
+            
+        if service == "http":
+            features["http_attack"] = 1
+            
+            # Extract HTTP-specific features
+            additional_data = attack_data.get("additional_data", {})
+            path = additional_data.get("path", "")
+            
+            # Check for common web attack patterns
+            web_attack_patterns = [
+                "wp-admin", "phpMyAdmin", "admin", "login.php", 
+                "wp-login", ".git", "../", "passwd", "/etc/", "select",
+                "union", "insert", "drop", "alert(", "<script"
+            ]
+            features["web_attack_pattern_count"] = sum(1 for patt in web_attack_patterns if patt in path)
+        else:
+            features["http_attack"] = 0
+            features["web_attack_pattern_count"] = 0
+        
+        return features
+    
+    def _calculate_risk_score(self, features: Dict[str, float]) -> float:
+        """Calculate a risk score based on extracted features"""
+        # Base risk score
+        risk_score = 0.0
+        
+        # Increment risk for high attack frequency
+        if features["attacks_per_hour"] > 10:
+            risk_score += 0.3
+        elif features["attacks_per_hour"] > 5:
+            risk_score += 0.2
+        elif features["attacks_per_hour"] > 1:
+            risk_score += 0.1
+        
+        # Increment risk for multi-service attacks
+        if features["service_count"] > 3:
+            risk_score += 0.3
+        elif features["service_count"] > 1:
+            risk_score += 0.2
+        
+        # Increment risk for command patterns
+        risk_score += min(0.4, features["malicious_indicator_count"] * 0.1)
+        
+        # Increment risk for web attack patterns
+        risk_score += min(0.3, features["web_attack_pattern_count"] * 0.05)
+        
+        # Clamp risk score between 0 and 1
+        return max(0.0, min(1.0, risk_score))
+    
+    def _detect_anomalies(self, features: Dict[str, float]) -> Tuple[bool, float]:
+        """Detect whether an attack is anomalous based on historical patterns"""
+        if not hasattr(self, 'anomaly_model') or self.anomaly_model is None:
+            return False, 0.0
+            
+        # Convert features to format expected by model
+        feature_vector = self._features_to_vector(features)
+        
+        # Use IsolationForest to detect anomalies
+        try:
+            # Reshape for single sample prediction
+            feature_vector = feature_vector.reshape(1, -1)
+            
+            # Get anomaly score (negative = more anomalous)
+            anomaly_score = -self.anomaly_model.score_samples(feature_vector)[0]
+            
+            # Determine if it's an anomaly (decision_function < 0 means anomaly)
+            is_anomaly = self.anomaly_model.decision_function(feature_vector)[0] < 0
+            
+            return is_anomaly, anomaly_score
+        except Exception as e:
+            self.logger.error(f"Error detecting anomalies: {e}")
+            return False, 0.0
+    
+    def _features_to_vector(self, features: Dict[str, float]) -> np.ndarray:
+        """Convert feature dictionary to numpy array for model input"""
+        # Define the expected feature order for models
+        feature_keys = [
+            "attack_count", "time_active_seconds", "attacks_per_hour",
+            "service_count", "unique_commands", "command_count",
+            "malicious_indicator_count", "login_attempt",
+            "username_length", "password_length", "has_special_chars",
+            "ssh_attack", "http_attack", "web_attack_pattern_count"
+        ]
+        
+        # Create feature vector with proper ordering
+        vector = np.array([features.get(key, 0.0) for key in feature_keys])
+        return vector
+    
+    def _load_model(self, model_name: str) -> Any:
+        """Load a saved ML model if it exists"""
+        model_path = os.path.join(self.models_dir, model_name)
+        if os.path.exists(model_path):
+            try:
+                self.ml_logger.info(f"Loading model from {model_path}")
+                return joblib.load(model_path)
+            except Exception as e:
+                self.logger.error(f"Error loading model {model_name}: {e}")
+        return None
+    
+    def _save_model(self, model: Any, model_name: str) -> bool:
+        """Save an ML model to disk"""
+        model_path = os.path.join(self.models_dir, model_name)
+        try:
+            joblib.dump(model, model_path)
+            self.ml_logger.info(f"Model saved to {model_path}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error saving model {model_name}: {e}")
+            return False
+    
+    def _train_anomaly_model(self) -> Any:
+        """Train the anomaly detection model using IsolationForest"""
+        self.ml_logger.info("Training anomaly detection model")
+        
+        # Collect attack data from logs
+        attack_data = self._collect_attack_data()
+        
+        if len(attack_data) < 10:
+            self.logger.warning("Not enough data to train anomaly model (need at least 10 samples)")
+            return None
+        
+        try:
+            # Extract features from each attack
+            features_list = [self._extract_features(attack) for attack in attack_data]
+            
+            # Convert to numpy array
+            X = np.array([self._features_to_vector(features) for features in features_list])
+            
+            # Train IsolationForest model
+            model = IsolationForest(
+                n_estimators=100,
+                max_samples='auto',
+                contamination=0.1,  # Assume 10% of data is anomalous
+                random_state=42
+            )
+            model.fit(X)
+            
+            # Save the model
+            self._save_model(model, "anomaly_model.pkl")
+            
+            self.ml_logger.info(f"Anomaly model trained on {len(X)} samples")
+            return model
+            
+        except Exception as e:
+            self.logger.error(f"Error training anomaly model: {e}")
+            return None
+    
+    def _train_risk_model(self) -> Any:
+        """Train the risk scoring model using RandomForestClassifier"""
+        self.ml_logger.info("Training risk scoring model")
+        
+        # Collect attack data from logs
+        attack_data = self._collect_attack_data()
+        
+        if len(attack_data) < 10:
+            self.logger.warning("Not enough data to train risk model (need at least 10 samples)")
+            return None
+        
+        try:
+            # Extract features from each attack
+            features_list = [self._extract_features(attack) for attack in attack_data]
+            
+            # Create synthetic labels for training
+            # (in real deployment this would use human-labeled data)
+            y = np.array([
+                1 if features["malicious_indicator_count"] > 0 or 
+                     features["web_attack_pattern_count"] > 0 else 0
+                for features in features_list
+            ])
+            
+            # Convert to numpy array
+            X = np.array([self._features_to_vector(features) for features in features_list])
+            
+            # Train RandomForestClassifier model
+            model = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=10,
+                random_state=42
+            )
+            model.fit(X, y)
+            
+            # Save the model
+            self._save_model(model, "risk_model.pkl")
+            
+            self.ml_logger.info(f"Risk model trained on {len(X)} samples")
+            return model
+            
+        except Exception as e:
+            self.logger.error(f"Error training risk model: {e}")
+            return None
+    
+    def _collect_attack_data(self) -> List[Dict[str, Any]]:
+        """Collect attack data from logs for model training"""
+        attack_data = []
+        
+        # Find attack log files
+        if os.path.exists(self.unified_log_file):
+            try:
+                with open(self.unified_log_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                attack = json.loads(line)
+                                attack_data.append(attack)
+                            except json.JSONDecodeError:
+                                continue
+            except Exception as e:
+                self.logger.error(f"Error reading attack log: {e}")
+        
+        return attack_data
+    
+    def _ml_model_update_loop(self) -> None:
+        """Background thread to periodically update ML models"""
+        while True:
+            current_time = time.time()
+            
+            # Update models if enough time has passed
+            if current_time - self.last_model_update > self.model_update_interval:
+                try:
+                    self.ml_logger.info("Starting periodic ML model update")
+                    
+                    # Update models
+                    self.anomaly_model = self._train_anomaly_model()
+                    self.risk_model = self._train_risk_model()
+                    
+                    self.last_model_update = current_time
+                    self.ml_logger.info("Periodic ML model update completed")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error during periodic ML model update: {e}")
+            
+            # Sleep before next check
+            time.sleep(60)  # Check every minute
+
 def daemonize():
     """Daemonize the current process (Unix-like systems only)."""
     try:
@@ -652,7 +1083,7 @@ def main():
     logger = setup_logging(config)
     logger.info("Starting honeypot system...")
 
-    unified_logger = UnifiedLogger(config)
+    unified_logger = self.logger(config)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -705,7 +1136,6 @@ def print_status(started_services):
 
     print(f"\n{Fore.YELLOW}Press Ctrl+C to stop the honeypot.")
     print(f"{Style.RESET_ALL}")
-
 
 def select_services(config, args):
     """Prompt user to select services to enable"""
@@ -1407,16 +1837,7 @@ def save_config(config: Dict[str, Any], config_path: str) -> bool:
         return False
 
 def _recursive_update(d: Dict[str, Any], u: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Recursively update a dictionary with another dictionary
 
-    Args:
-        d: Dictionary to update
-        u: Dictionary with updates
-
-    Returns:
-        Updated dictionary
-    """
     for k, v in u.items():
         if isinstance(v, dict) and k in d and isinstance(d[k], dict):
             _recursive_update(d[k], v)
@@ -1458,40 +1879,50 @@ def print_status(started_services, dashboard_port=None, analytics_enabled=False)
     print(f"{Style.RESET_ALL}")
 
 def check_for_updates():
-    """Check for new version and perform git pull if needed."""
+    """Check if a newer version is available and force update if needed"""
+    current_version_file = os.path.join(os.path.dirname(__file__), 'version.txt')
+    if not os.path.isfile(current_version_file):
+        print("Version file not found.")
+        return
+
+    with open(current_version_file, 'r') as f:
+        current_version = f.read().strip()
+
     try:
-        if not os.path.exists(VERSION_FILE):
-            print(f"{Fore.RED}Local version file not found at {VERSION_FILE}")
-            return
+        response = requests.get("https://raw.githubusercontent.com/sec0ps/jebakan/main/version.txt", timeout=5)
+        if response.status_code == 200:
+            latest_version = response.text.strip()
+            if latest_version != current_version:
+                print(f"Update available: {latest_version} (current: {current_version})")
+                print("Pulling latest changes from GitHub...")
 
-        with open(VERSION_FILE, 'r') as f:
-            local_version = f.read().strip()
+                try:
+                    subprocess.run(["git", "reset", "--hard"], check=True)
+                    subprocess.run(["git", "clean", "-fd"], check=True)
+                    subprocess.run(["git", "pull"], check=True)
 
-        resp = requests.get(REMOTE_VERSION_URL, timeout=5)
-        if resp.status_code != 200:
-            print(f"{Fore.YELLOW}Unable to fetch remote version info.")
-            return
+                    # Overwrite version.txt with the new version
+                    with open(current_version_file, 'w') as f:
+                        f.write(latest_version + "\n")
 
-        remote_version = resp.text.strip()
-
-        if version.parse(remote_version) > version.parse(local_version):
-            print(f"{Fore.YELLOW}Update available: {remote_version} (current: {local_version})")
-            print(f"{Fore.CYAN}Pulling latest changes from GitHub...")
-
-            result = subprocess.run(["git", "pull"], cwd=base_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-            if result.returncode == 0:
-                print(f"{Fore.GREEN}Update pulled successfully. Please restart the honeypot.")
+                    print("Update completed successfully.")
+                except subprocess.CalledProcessError as e:
+                    print(f"Git update failed: {e}")
             else:
-                print(f"{Fore.RED}Git pull failed:\n{result.stderr}")
-
-            sys.exit(0)
-
+                print("Jebakan is up to date.")
         else:
-            print(f"{Fore.GREEN}You are running the latest version ({local_version}).")
-
+            print("Failed to check for updates.")
     except Exception as e:
-        print(f"{Fore.RED}Auto-update failed: {e}")
+        print(f"Update check error: {e}")
+
+def force_git_update():
+    try:
+        subprocess.run(["git", "reset", "--hard"], check=True)
+        subprocess.run(["git", "clean", "-fd"], check=True)
+        subprocess.run(["git", "pull"], check=True)
+        print("Forced update completed.")
+    except subprocess.CalledProcessError as e:
+        print(f"Update failed: {e}")
 
 def main():
     global logger, running
