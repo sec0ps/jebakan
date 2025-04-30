@@ -1,32 +1,3 @@
-# =============================================================================
-# Jebakan - Python-Based Honeypot System
-# =============================================================================
-#
-# Author: Keith Pachulski
-# Company: Red Cell Security, LLC
-# Email: keith@redcellsecurity.org
-# Website: www.redcellsecurity.org
-#
-# Copyright (c) 2025 Keith Pachulski. All rights reserved.
-#
-# License: This software is licensed under the MIT License.
-#          You are free to use, modify, and distribute this software
-#          in accordance with the terms of the license.
-#
-# Purpose: This module is part of the Jebakan honeypot system, designed to
-#          create convincing decoy systems to attract and detect attackers.
-#          It provides service emulation, attack logging, and threat intelligence
-#          gathering capabilities for cybersecurity research and network protection.
-#
-# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
-#             express or implied, including but not limited to the warranties
-#             of merchantability, fitness for a particular purpose, and non-infringement.
-#             In no event shall the authors or copyright holders be liable for any claim,
-#             damages, or other liability, whether in an action of contract, tort, or otherwise,
-#             arising from, out of, or in connection with the software or the use or other dealings
-#             in the software.
-#
-# =============================================================================
 #!/usr/bin/env python3
 """
 FTP service emulator for the honeypot system
@@ -47,7 +18,7 @@ from services.base_service import BaseService
 class FTPService(BaseService):
     """FTP service emulator for the honeypot"""
     
-    def __init__(self, host: str, port: int, config: Dict[str, Any]):
+    def __init__(self, host: str, port: int, config: Dict[str, Any], unified_logger=None):
         """
         Initialize the FTP service
         
@@ -55,10 +26,17 @@ class FTPService(BaseService):
             host: Host IP to bind to
             port: Port to listen on
             config: Global configuration dictionary
+            unified_logger: Unified logging system
         """
         super().__init__(host, port, config, "ftp")
+        self.unified_logger = unified_logger
         
-        # Set up FTP server
+        # Verify that credentials were loaded
+        self.logger.debug(f"FTP Service initialized. Path to config: {config.get('config_path', 'Unknown')}")
+        self.logger.debug(f"Available credentials: {self.credentials}")
+        self.logger.debug(f"Service config: {self.service_config}")
+
+        # Set up FTP server banner as an instance attribute
         self.banner = self.service_config.get("banner", "220 FTP Server Ready")
         
         # Create fake filesystem structure
@@ -135,31 +113,63 @@ environment = production
             "commands": [],
             "data_sock": None  # explicitly track the passive socket
         }
-
+    
         self._send_response(client_socket, self.banner)
-
+    
         try:
             while True:
                 cmd_line = client_socket.recv(1024).decode('utf-8', errors='ignore').strip()
                 if not cmd_line:
                     break
-
+    
                 if " " in cmd_line:
                     cmd, arg = cmd_line.split(" ", 1)
                 else:
                     cmd, arg = cmd_line, ""
-
+    
                 cmd = cmd.upper()
-
+    
                 session = self.sessions[session_id]
                 current_dir = session["current_dir"]
-
+    
+                # Record the command in connection data if available
+                if "data" in connection_data:
+                    connection_data["data"].setdefault("commands", []).append({
+                        "timestamp": datetime.datetime.now().isoformat(),
+                        "command": cmd_line
+                    })
+    
                 if cmd == "USER":
                     session["username"] = arg
                     self._send_response(client_socket, "331 User name okay, need password.")
                 elif cmd == "PASS":
                     username = session["username"]
-                    if self.is_valid_credentials(username, arg):
+                    password = arg
+                    
+                    # Log the authentication attempt
+                    auth_data = {
+                        "username": username,
+                        "password": password,
+                        "timestamp": datetime.datetime.now().isoformat()
+                    }
+                    
+                    # Add to connection data if available
+                    if "data" in connection_data:
+                        connection_data["data"].setdefault("auth_attempts", []).append(auth_data)
+                    
+                    self.logger.info(f"FTP authentication attempt from {address[0]} with username '{username}' and password '{password}'")
+                    
+                    # Log the authentication attempt to the unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="ftp",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command="login_attempt",
+                            additional_data=auth_data
+                        )
+                    
+                    if self.is_valid_credentials(username, password):
                         session["authenticated"] = True
                         self._send_response(client_socket, "230 User logged in, proceed.")
                     else:
@@ -185,16 +195,16 @@ environment = production
                     psock.bind((self.host, 0))
                     psock.listen(1)
                     _, data_port = psock.getsockname()
-
+    
                     # Fix passive IP response
                     real_host = self.config.get("public_ip", self.host)
                     if real_host == "0.0.0.0":
                         real_host = "127.0.0.1"
-
+    
                     ip_parts = real_host.split(".")
                     p1, p2 = data_port // 256, data_port % 256
                     self._send_response(client_socket, f"227 Entering Passive Mode ({','.join(ip_parts)},{p1},{p2}).")
-
+    
                     # Accept data connection in background
                     def wait_for_data_conn():
                         try:
@@ -205,10 +215,19 @@ environment = production
                             self.logger.warning(f"Passive mode connection failed: {e}")
                         finally:
                             psock.close()
-
+    
                     threading.Thread(target=wait_for_data_conn, daemon=True).start()
-
+    
                 elif cmd == "LIST":
+                    # Log the LIST command to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="ftp",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command=f"LIST {arg}"
+                        )
+                    
                     self._send_response(client_socket, "150 Here comes the directory listing.")
                     time.sleep(1)
                     if session["data_sock"]:
@@ -223,8 +242,17 @@ environment = production
                             self._send_response(client_socket, "426 Data connection error.")
                     else:
                         self._send_response(client_socket, "425 Can't open data connection.")
-
+    
                 elif cmd == "RETR":
+                    # Log the file retrieval attempt to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="ftp",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command=f"RETR {arg}"
+                        )
+                    
                     file_path = os.path.join(self.ftproot, current_dir.strip("/"), arg)
                     if os.path.isfile(file_path) and session["data_sock"]:
                         self._send_response(client_socket, f"150 Opening binary mode data connection for {arg}")
@@ -241,8 +269,17 @@ environment = production
                             self._send_response(client_socket, "451 Requested action aborted. Local error.")
                     else:
                         self._send_response(client_socket, "550 File not found or no data connection.")
-
+    
                 elif cmd == "STOR":
+                    # Log the file upload attempt to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="ftp",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command=f"STOR {arg}"
+                        )
+                    
                     upload_path = os.path.join(self.ftproot, "upload", arg)
                     if session["data_sock"]:
                         self._send_response(client_socket, f"150 Ok to send data for {arg}")
@@ -262,11 +299,19 @@ environment = production
                             self._send_response(client_socket, "451 Transfer aborted due to error.")
                     else:
                         self._send_response(client_socket, "425 Can't open data connection.")
-
+    
                 elif cmd == "QUIT":
                     self._send_response(client_socket, "221 Goodbye.")
                     break
                 else:
+                    # Log other commands to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="ftp",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command=cmd_line
+                        )
                     self._send_response(client_socket, "502 Command not implemented.")
         except Exception as e:
             self.logger.error(f"FTP session error: {e}")
@@ -279,7 +324,32 @@ environment = production
                         pass
                 del self.sessions[session_id]
 
-    
+    def is_valid_credentials(self, username: str, password: str) -> bool:
+        """
+        Check if credentials are valid for FTP login by reading from config
+        
+        Args:
+            username: Username
+            password: Password
+            
+        Returns:
+            True if credentials are valid, False otherwise
+        """
+        # Log to debug what credentials we're checking
+        self.logger.debug(f"Validating credentials for user: {username}")
+        
+        # Print the loaded credentials for debugging
+        self.logger.debug(f"Loaded credentials: {self.credentials}")
+        
+        # Use the credentials loaded from the configuration
+        for cred in self.credentials:
+            if cred.get("username") == username and cred.get("password") == password:
+                self.logger.info(f"Valid credentials match for {username}")
+                return True
+        
+        self.logger.info(f"No valid credential match for {username}")
+        return False
+
     def _send_response(self, client_socket: socket.socket, response: str) -> None:
         """
         Send an FTP response to the client
