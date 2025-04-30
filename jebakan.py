@@ -896,6 +896,54 @@ class UnifiedLogger:
             # Sleep before next check
             time.sleep(60)  # Check every minute
 
+def configure_siem(config_path):
+    """Configure SIEM integration via interactive prompt"""
+    try:
+        # Load current configuration
+        config = load_config(config_path)
+        
+        print(f"\n{Fore.CYAN}=== SIEM Configuration ==={Style.RESET_ALL}")
+        print("This will configure the connection to your SIEM server.")
+        
+        # Get SIEM server details
+        ip_address = input("Enter SIEM server IP address: ").strip()
+        port = input("Enter SIEM server port: ").strip()
+        
+        try:
+            # Validate IP address format
+            socket.inet_aton(ip_address)
+            port = int(port)
+            
+            # Validate port range
+            if not (1 <= port <= 65535):
+                raise ValueError("Port must be between 1 and 65535")
+            
+            # Ensure the siem-server section exists in config
+            if "siem-server" not in config:
+                config["siem-server"] = {}
+            
+            # Update configuration
+            config["siem-server"] = {
+                "enabled": True,
+                "ip_address": ip_address,
+                "port": port
+            }
+            
+            # Save the updated configuration
+            if save_config(config, config_path):
+                print(f"{Fore.GREEN}SIEM configuration saved successfully.{Style.RESET_ALL}")
+                print(f"The honeypot will forward logs to {ip_address}:{port}")
+            else:
+                print(f"{Fore.RED}Failed to save SIEM configuration.{Style.RESET_ALL}")
+                
+        except socket.error:
+            print(f"{Fore.RED}Invalid IP address format.{Style.RESET_ALL}")
+        except ValueError as e:
+            print(f"{Fore.RED}Invalid port: {e}{Style.RESET_ALL}")
+            
+    except Exception as e:
+        print(f"{Fore.RED}Error configuring SIEM: {e}{Style.RESET_ALL}")
+
 def daemonize():
     """Daemonize the current process (Unix-like systems only)."""
     try:
