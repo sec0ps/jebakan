@@ -1589,7 +1589,7 @@ DEFAULT_CONFIG = {
                 {"username": "root", "password": "toor"},
                 {"username": "user", "password": "123456"}
             ],
-            "interaction_level": "medium"  # low, medium, high
+            "interaction_level": "high"  # low, medium, high
         },
         "http": {
             "enabled": True,
@@ -1601,7 +1601,7 @@ DEFAULT_CONFIG = {
                 "/phpmyadmin",
                 "/wordpress/wp-admin"
             ],
-            "interaction_level": "medium"
+            "interaction_level": "high"
         },
         "ftp": {
             "enabled": True,
@@ -1613,7 +1613,7 @@ DEFAULT_CONFIG = {
                 {"username": "admin", "password": "admin"},
                 {"username": "ftpuser", "password": "ftppass"}
             ],
-            "interaction_level": "medium"
+            "interaction_level": "high"
         },
         "telnet": {
             "enabled": True,
@@ -1625,7 +1625,7 @@ DEFAULT_CONFIG = {
                 {"username": "root", "password": "root"},
                 {"username": "user", "password": "password"}
             ],
-            "interaction_level": "medium"
+            "interaction_level": "high"
         },
         "mysql": {
             "enabled": True,
@@ -1638,7 +1638,7 @@ DEFAULT_CONFIG = {
                 {"username": "admin", "password": "admin123"},
                 {"username": "dbuser", "password": "dbpass"}
             ],
-            "interaction_level": "medium"
+            "interaction_level": "high"
         },
         "mssql": {
             "enabled": True,
@@ -1653,7 +1653,7 @@ DEFAULT_CONFIG = {
                 {"username": "admin", "password": "admin123"},
                 {"username": "sqlserver", "password": "sqlserver"}
             ],
-            "interaction_level": "medium"
+            "interaction_level": "high"
         },
         "rdp": {
             "enabled": True,
@@ -1666,7 +1666,7 @@ DEFAULT_CONFIG = {
                 {"username": "admin", "password": "admin123"},
                 {"username": "user", "password": "user123"}
             ],
-            "interaction_level": "medium"
+            "interaction_level": "high"
         },
         "vnc": {
             "enabled": True,
@@ -1678,7 +1678,7 @@ DEFAULT_CONFIG = {
                 {"username": "", "password": "admin"},
                 {"username": "", "password": "secret"}
             ],
-            "interaction_level": "medium"
+            "interaction_level": "high"
         },
         "redis": {
             "enabled": True,
@@ -1686,21 +1686,21 @@ DEFAULT_CONFIG = {
             "server_version": "5.0.7",
             "password": "redis123",
             "require_auth": True,
-            "interaction_level": "medium"
+            "interaction_level": "high"
         },
         "elasticsearch": {
             "enabled": True,
             "port": 9200,
             "server_version": "6.8.0",
             "cluster_name": "elasticsearch-cluster",
-            "interaction_level": "medium"
+            "interaction_level": "high"
         },
         "docker": {
             "enabled": True,
             "port": 2375,
             "api_version": "1.41",
             "docker_version": "20.10.7",
-            "interaction_level": "medium"
+            "interaction_level": "high"
         }
     },
     "logging": {
