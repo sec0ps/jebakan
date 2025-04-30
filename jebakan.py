@@ -285,7 +285,7 @@ class UnifiedLogger:
             self.ml_update_thread = threading.Thread(target=self._ml_model_update_loop, daemon=True)
             self.ml_update_thread.start()
             
-            self.ml_logger.info("ML capabilities initialized in self.ml_logger")
+            self.logger.info("ML capabilities initialized in self.ml_logger")
 
     def log_attack(self, service: str, attacker_ip: str, attacker_port: int, 
                    command: str, additional_data: Dict[str, Any] = None) -> None:
