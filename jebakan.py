@@ -74,7 +74,7 @@ init(autoreset=True)
 running = True
 active_services = []
 logger = None
-config_path = os.path.join(base_dir, "honeypot.json")
+config_path = os.path.join(base_dir, "config", "honeypot.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1892,6 +1892,8 @@ def check_for_updates():
         response = requests.get("https://raw.githubusercontent.com/sec0ps/jebakan/main/version.txt", timeout=5)
         if response.status_code == 200:
             latest_version = response.text.strip()
+
+            # Compare strictly
             if latest_version != current_version:
                 print(f"Update available: {latest_version} (current: {current_version})")
                 print("Pulling latest changes from GitHub...")
@@ -1901,7 +1903,7 @@ def check_for_updates():
                     subprocess.run(["git", "clean", "-fd"], check=True)
                     subprocess.run(["git", "pull"], check=True)
 
-                    # Overwrite version.txt with the new version
+                    # Update local version.txt
                     with open(current_version_file, 'w') as f:
                         f.write(latest_version + "\n")
 
@@ -1911,7 +1913,7 @@ def check_for_updates():
             else:
                 print("Jebakan is up to date.")
         else:
-            print("Failed to check for updates.")
+            print("Failed to check for updates (HTTP status {}).".format(response.status_code))
     except Exception as e:
         print(f"Update check error: {e}")
 
