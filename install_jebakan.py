@@ -69,6 +69,27 @@ INSTALL_DIR = '/opt/jebakan'
 USER_NAME = 'jebakan'
 GROUP_NAME = 'jebakan'
 
+def install_jebakan():
+    """Install the Jebakan Honeypot"""
+    logger.info("Starting Jebakan installation...")
+    install_dependencies()
+    create_user_and_group()
+    setup_installation_directory()
+    copy_program_files()
+    create_log_directory()
+    create_systemd_service()
+
+    # Enable and start the service
+    logger.info("Enabling and starting Jebakan service...")
+    try:
+        subprocess.run(["systemctl", "enable", "jebakan"], check=True)
+        subprocess.run(["systemctl", "start", "jebakan"], check=True)
+        logger.info("Jebakan service enabled and started")
+        print("\nJebakan Honeypot has been successfully installed and started.")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to enable/start service: {e}")
+        print("\nJebakan installed, but there was an issue starting the service. Please check the logs.")
+
 def check_root():
     """Check if script is running with root privileges"""
     if os.geteuid() != 0:
@@ -169,7 +190,7 @@ def copy_program_files():
         '*.log',
         'venv',
         'env',
-        '.git',
+#        '.git',
         '.idea',
         '.vscode'
     ]
@@ -294,7 +315,7 @@ Type=simple
 User=jebakan
 Group=jebakan
 WorkingDirectory=/opt/jebakan
-ExecStart=/usr/bin/python3 /opt/jebakan/jebakan.py
+ExecStart=/usr/bin/python3 /opt/jebakan/jebakan.py -d
 Restart=on-failure
 RestartSec=5s
 
