@@ -70,25 +70,31 @@ USER_NAME = 'jebakan'
 GROUP_NAME = 'jebakan'
 
 def install_jebakan():
-    """Install the Jebakan Honeypot"""
+    """Install Jebakan Honeypot"""
     logger.info("Starting Jebakan installation...")
+    
+    # Install dependencies
     install_dependencies()
+    
+    # Create user and group
     create_user_and_group()
+    
+    # Set up installation directory
     setup_installation_directory()
+    
+    # Copy program files
     copy_program_files()
+    
+    # Create log directory
     create_log_directory()
+    
+    # Create systemd service
     create_systemd_service()
-
-    # Enable and start the service
-    logger.info("Enabling and starting Jebakan service...")
-    try:
-        subprocess.run(["systemctl", "enable", "jebakan"], check=True)
-        subprocess.run(["systemctl", "start", "jebakan"], check=True)
-        logger.info("Jebakan service enabled and started")
-        print("\nJebakan Honeypot has been successfully installed and started.")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to enable/start service: {e}")
-        print("\nJebakan installed, but there was an issue starting the service. Please check the logs.")
+    
+    logger.info("Installation completed successfully")
+    print("\nJebakan Honeypot has been installed to /opt/jebakan")
+    print("To start the service, run: sudo systemctl start jebakan")
+    print("To enable at boot: sudo systemctl enable jebakan")
 
 def check_root():
     """Check if script is running with root privileges"""
