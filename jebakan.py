@@ -40,13 +40,16 @@ import argparse
 import signal
 import sys
 import re
+import copy
 import geoip2.database
+import subprocess
+from packaging import version
+import requests
 from typing import Dict, Any, Tuple, Optional
 import colorama
 from colorama import Fore, Style, init
-from utils.config_manager import load_config, save_config
 
-base_dir = os.path.dirname(os.path.abspath(__file__))
+base_dir = "/opt/jebakan"
 
 pid_dir = os.path.join(base_dir, "config")
 if not os.path.exists(pid_dir):
@@ -72,11 +75,27 @@ logging.basicConfig(
 
 def setup_logging(config):
     """Set up logging based on configuration"""
-    if not os.path.exists(config["logging"]["dir"]):
-        os.makedirs(config["logging"]["dir"])
+    log_dir = config["logging"]["dir"]
+    
+    # Use absolute path for logging directory
+    if not os.path.isabs(log_dir):
+        log_dir = os.path.join(base_dir, log_dir)
+        config["logging"]["dir"] = log_dir
+    
+    try:
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+    except PermissionError:
+        # Fallback to the base_dir/logs if permission denied
+        fallback_dir = os.path.join(base_dir, "logs")
+        if not os.path.exists(fallback_dir):
+            os.makedirs(fallback_dir, exist_ok=True)
+        config["logging"]["dir"] = fallback_dir
+        log_dir = fallback_dir
+        print(f"Permission denied for {log_dir}, using {fallback_dir} instead")
 
     logging.basicConfig(
-        filename=f"{config['logging']['dir']}/honeypot_{datetime.datetime.now().strftime('%Y%m%d')}.log",
+        filename=f"{log_dir}/honeypot_{datetime.datetime.now().strftime('%Y%m%d')}.log",
         level=getattr(logging, config["logging"]["level"]),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
@@ -464,16 +483,25 @@ def daemonize():
         print(f"Fork #2 failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Redirect standard file descriptors
+    # Make sure config directory exists with proper permissions
+    if not os.path.exists(os.path.join(base_dir, "config")):
+        os.makedirs(os.path.join(base_dir, "config"), exist_ok=True)
+        
+    # Make sure logs directory exists with proper permissions before redirecting output
+    logs_dir = os.path.join(base_dir, "logs")
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir, exist_ok=True)
+    
+    # Write logs to a file
+    log_path = os.path.join(base_dir, "config", "jebakan.daemon.log")
     sys.stdout.flush()
     sys.stderr.flush()
-    with open('/dev/null', 'rb', 0) as dev_null:
-        os.dup2(dev_null.fileno(), sys.stdin.fileno())
-    with open('/dev/null', 'ab', 0) as dev_null:
-        os.dup2(dev_null.fileno(), sys.stdout.fileno())
-        os.dup2(dev_null.fileno(), sys.stderr.fileno())
 
-    # Save PID to config directory
+    with open(log_path, 'a+') as out_log:
+        os.dup2(out_log.fileno(), sys.stdout.fileno())
+        os.dup2(out_log.fileno(), sys.stderr.fileno())
+
+    # Save PID
     with open(PID_FILE, 'w') as f:
         f.write(str(os.getpid()))
 
@@ -560,75 +588,104 @@ def print_service_menu(config):
 def main():
     global logger, running
 
-    # Handle 'help' manually BEFORE parsing arguments
-    if len(sys.argv) > 1 and sys.argv[1].lower() == "help":
-        print("\nUsage:")
-        print("  python jebakan.py --help          Show this help message and exit")
-        print("  python jebakan.py --config-siem    Configure SIEM integration")
-        print("  python jebakan.py [options]        Start honeypot with selected options")
-        sys.exit(0)
-
     parser = argparse.ArgumentParser(description="Python Honeypot System")
     parser.add_argument("-c", "--config", help="Path to configuration file", default="config/honeypot.json")
     parser.add_argument("-v", "--verbose", help="Increase output verbosity", action="store_true")
     parser.add_argument("-n", "--no-prompt", help="Start with default services (no interactive prompt)", action="store_true")
-    parser.add_argument("--interaction", choices=["low", "medium", "high"],
-                        help="Set global interaction level for all services")
+    parser.add_argument("--interaction", choices=["low", "medium", "high"], help="Set global interaction level for all services")
     parser.add_argument("--services", help="Comma-separated list of services to enable or 'all'", type=str)
     parser.add_argument("--config-siem", action="store_true", help="Configure SIEM integration")
+    parser.add_argument("-d", "--daemon", action="store_true", help="Run as background daemon")
+    parser.add_argument("--stop", action="store_true", help="Stop the running daemon")
+
     args = parser.parse_args()
 
+    # Handle stop request
+    if args.stop:
+        stop_daemon()
+        return
+
+    # Handle SIEM configuration standalone
+    if args.config_siem:
+        configure_siem(args.config)
+        return
+
+    # Create necessary directories before daemonizing
+    if not os.path.exists(os.path.join(base_dir, "logs")):
+        try:
+            os.makedirs(os.path.join(base_dir, "logs"), exist_ok=True)
+        except PermissionError:
+            print(f"Warning: Permission denied when creating logs directory at {os.path.join(base_dir, 'logs')}")
+            
+    if not os.path.exists(os.path.join(base_dir, "config")):
+        try:
+            os.makedirs(os.path.join(base_dir, "config"), exist_ok=True)
+        except PermissionError:
+            print(f"Warning: Permission denied when creating config directory at {os.path.join(base_dir, 'config')}")
+
+    # Daemonize early, before any output
+    if args.daemon:
+        daemonize()
+
     print_banner()
-    config = load_config(args.config)
+
+    config = load_config(config_path)
 
     if args.verbose:
         config["logging"]["level"] = "DEBUG"
         config["logging"]["console"] = True
 
-    # Apply global interaction level if specified
     if args.interaction:
-        for service in config.get("services", {}):
-            config["services"].setdefault(service, {})
-            config["services"][service]["interaction_level"] = args.interaction
-
-        default_ports = {
-            "ssh": 2222, "http": 8080, "ftp": 2121, "telnet": 2323,
-            "mysql": 3306, "mssql": 1433, "rdp": 3389, "vnc": 5900,
-            "redis": 6379, "elasticsearch": 9200, "docker": 2375
-        }
-        for svc, port in default_ports.items():
-            if svc not in config["services"]:
-                config["services"][svc] = {
-                    "enabled": False,
-                    "port": port,
-                    "interaction_level": args.interaction
-                }
-
         config["global_interaction_level"] = args.interaction
-        save_config(config, args.config)
+        for svc in config.get("services", {}).values():
+            svc["interaction_level"] = args.interaction
+            
+    # Ensure log directory path is absolute
+    if "logging" in config and "dir" in config["logging"]:
+        if not os.path.isabs(config["logging"]["dir"]):
+            config["logging"]["dir"] = os.path.join(base_dir, config["logging"]["dir"])
 
     logger = setup_logging(config)
     logger.info("Starting honeypot system...")
 
+    unified_logger = UnifiedLogger(config)
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    if args.no_prompt:
-        services_to_enable = [s for s, scfg in config["services"].items() if scfg.get("enabled")]
+    # Select services
+    service_map = [
+        "ssh", "http", "ftp", "telnet", "mysql", "mssql",
+        "rdp", "vnc", "redis", "elasticsearch", "docker"
+    ]
 
+    if args.no_prompt or args.services:
+        if args.services:
+            cleaned = args.services.strip().lower()
+            services_to_enable = service_map if cleaned == "all" else [s for s in cleaned.split(',') if s in service_map]
+        else:
+            services_to_enable = [s for s, scfg in config["services"].items() if scfg.get("enabled")]
     else:
         result = select_services(config, args)
-        if result is None:
+        if not result:
             print(f"{Fore.YELLOW}Exiting...")
             return
         services_to_enable = result
 
-        print(f"[DEBUG] main(): Got services_to_enable: {services_to_enable}")
-
-        save_config(config, args.config)
-
     started_services = start_services(config, services_to_enable, unified_logger)
 
+    if args.interaction:
+        save_config(config, args.config)
+
+    print_status(started_services)
+    logger.info(f"Honeypot started with {len(started_services)} service(s)")
+
+    try:
+        while running:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        running = False
+        logger.info("Shutting down honeypot...")
 
 def print_status(started_services):
     """Print the status of started services"""
@@ -648,7 +705,6 @@ def print_status(started_services):
 
 def select_services(config, args):
     """Prompt user to select services to enable"""
-    from utils.config_manager import save_config
 
     if "global_interaction_level" not in config:
         config["global_interaction_level"] = args.interaction or "high"
@@ -1081,6 +1137,291 @@ def start_services(config, services_to_enable, unified_logger=None):
 
     return started_services
 
+################# CONFIG MANAGER ########################
+# Default configuration
+DEFAULT_CONFIG = {
+    "network": {
+        "bind_ip": "0.0.0.0",
+        "max_connections": 100
+    },
+    "services": {
+        "ssh": {
+            "enabled": True,
+            "port": 2222,  # Using non-standard ports to avoid conflicts
+            "banner": "SSH-2.0-OpenSSH_7.4p1 Ubuntu-10",
+            "auth_attempts": 3,
+            "credentials": [
+                {"username": "admin", "password": "password123"},
+                {"username": "root", "password": "toor"},
+                {"username": "user", "password": "123456"}
+            ],
+            "interaction_level": "medium"  # low, medium, high
+        },
+        "http": {
+            "enabled": True,
+            "port": 8080,
+            "server_name": "Apache/2.4.41 (Ubuntu)",
+            "webroot": "data/http",
+            "vulnerable_pages": [
+                "/admin",
+                "/phpmyadmin",
+                "/wordpress/wp-admin"
+            ],
+            "interaction_level": "medium"
+        },
+        "ftp": {
+            "enabled": True,
+            "port": 2121,
+            "banner": "220 FTP Server Ready",
+            "auth_attempts": 3,
+            "credentials": [
+                {"username": "anonymous", "password": ""},
+                {"username": "admin", "password": "admin"},
+                {"username": "ftpuser", "password": "ftppass"}
+            ],
+            "interaction_level": "medium"
+        },
+        "telnet": {
+            "enabled": True,
+            "port": 2323,
+            "banner": "Ubuntu 18.04 LTS",
+            "auth_attempts": 3,
+            "credentials": [
+                {"username": "admin", "password": "admin"},
+                {"username": "root", "password": "root"},
+                {"username": "user", "password": "password"}
+            ],
+            "interaction_level": "medium"
+        },
+        "mysql": {
+            "enabled": True,
+            "port": 3306,
+            "server_version": "5.7.34-log",
+            "auth_attempts": 3,
+            "credentials": [
+                {"username": "root", "password": ""},
+                {"username": "root", "password": "password"},
+                {"username": "admin", "password": "admin123"},
+                {"username": "dbuser", "password": "dbpass"}
+            ],
+            "interaction_level": "medium"
+        },
+        "mssql": {
+            "enabled": True,
+            "port": 1433,
+            "server_version": "Microsoft SQL Server 2019",
+            "server_name": "SQLSERVER",
+            "instance_name": "MSSQLSERVER",
+            "auth_attempts": 3,
+            "credentials": [
+                {"username": "sa", "password": "sa"},
+                {"username": "sa", "password": "password"},
+                {"username": "admin", "password": "admin123"},
+                {"username": "sqlserver", "password": "sqlserver"}
+            ],
+            "interaction_level": "medium"
+        },
+        "rdp": {
+            "enabled": True,
+            "port": 3389,
+            "server_name": "WIN-SERVER2019",
+            "os_version": "Windows Server 2019",
+            "auth_attempts": 3,
+            "credentials": [
+                {"username": "Administrator", "password": "P@ssw0rd"},
+                {"username": "admin", "password": "admin123"},
+                {"username": "user", "password": "user123"}
+            ],
+            "interaction_level": "medium"
+        },
+        "vnc": {
+            "enabled": True,
+            "port": 5900,
+            "server_version": "RFB 003.008",
+            "auth_attempts": 3,
+            "credentials": [
+                {"username": "", "password": "password"},
+                {"username": "", "password": "admin"},
+                {"username": "", "password": "secret"}
+            ],
+            "interaction_level": "medium"
+        },
+        "redis": {
+            "enabled": True,
+            "port": 6379,
+            "server_version": "5.0.7",
+            "password": "redis123",
+            "require_auth": True,
+            "interaction_level": "medium"
+        },
+        "elasticsearch": {
+            "enabled": True,
+            "port": 9200,
+            "server_version": "6.8.0",
+            "cluster_name": "elasticsearch-cluster",
+            "interaction_level": "medium"
+        },
+        "docker": {
+            "enabled": True,
+            "port": 2375,
+            "api_version": "1.41",
+            "docker_version": "20.10.7",
+            "interaction_level": "medium"
+        }
+    },
+    "logging": {
+        "dir": "logs/",
+        "level": "INFO",
+        "console": True,
+        "rotation": {
+            "enabled": True,
+            "max_size_mb": 10,
+            "backup_count": 5
+        }
+    },
+    "analytics": {
+        "enabled": True,
+        "database": {
+            "type": "sqlite",  # sqlite, mysql, postgresql
+            "path": "data/honeypot.db",
+            "host": "",
+            "port": 0,
+            "user": "",
+            "password": "",
+            "name": ""
+        },
+        "analysis_interval": 300  # seconds
+    },
+    "alerts": {
+        "email": {
+            "enabled": False,
+            "smtp_server": "",
+            "smtp_port": 587,
+            "use_tls": True,
+            "username": "",
+            "password": "",
+            "from_address": "",
+            "to_addresses": []
+        },
+        "webhook": {
+            "enabled": False,
+            "url": ""
+        },
+        "threshold": {
+            "connection_count": 10,  # Alert after 10 connections from same IP
+            "time_window": 60  # In seconds
+        }
+    },
+    "dashboard": {
+        "enabled": True,
+        "port": 8000,
+        "username": "admin",
+        "password": "honeypot"
+    },
+    "deception": {
+        "fake_filesystem": {
+            "enabled": True,
+            "path": "data/fake_fs"
+        },
+        "fake_processes": [
+            {"name": "nginx", "pid": 1234},
+            {"name": "mysql", "pid": 2345},
+            {"name": "postgres", "pid": 3456}
+        ],
+        "breadcrumbs": True,  # Add fake sensitive info as breadcrumbs
+        "system_info": {
+            "hostname": "web-prod-01",
+            "os": "Ubuntu 18.04.5 LTS",
+            "kernel": "4.15.0-112-generic"
+        }
+    },
+    "resource_limits": {
+        "max_memory_mb": 1024,
+        "max_cpu_percent": 50,
+        "connection_timeout": 300  # seconds
+    }
+}
+
+def load_config(config_path: str) -> Dict[str, Any]:
+    """
+    Load configuration from a JSON file.
+    If file doesn't exist, create it with default config.
+
+    Args:
+        config_path: Path to the configuration file
+
+    Returns:
+        Dict containing configuration
+    """
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+    # If config file doesn't exist, create it with defaults
+    if not os.path.exists(config_path):
+        save_config(DEFAULT_CONFIG, config_path)
+        logging.info(f"Created default configuration at {config_path}")
+        return copy.deepcopy(DEFAULT_CONFIG)
+
+    # Load existing config
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            logging.info(f"Loaded configuration from {config_path}")
+
+            # Ensure all default keys exist (for backwards compatibility)
+            merged_config = copy.deepcopy(DEFAULT_CONFIG)  # <-- Deep copy fixes overwriting issue
+            _recursive_update(merged_config, config)
+
+            return merged_config
+    except Exception as e:
+        logging.error(f"Error loading config from {config_path}: {e}")
+        logging.info("Using default configuration")
+        return copy.deepcopy(DEFAULT_CONFIG)
+
+def save_config(config: Dict[str, Any], config_path: str) -> bool:
+    """
+    Save configuration to a JSON file
+
+    Args:
+        config: Configuration dictionary
+        config_path: Path to save the configuration
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=4)
+
+        logging.info(f"Saved configuration to {config_path}")
+        return True
+    except Exception as e:
+        logging.error(f"Error saving config to {config_path}: {e}")
+        return False
+
+def _recursive_update(d: Dict[str, Any], u: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Recursively update a dictionary with another dictionary
+
+    Args:
+        d: Dictionary to update
+        u: Dictionary with updates
+
+    Returns:
+        Updated dictionary
+    """
+    for k, v in u.items():
+        if isinstance(v, dict) and k in d and isinstance(d[k], dict):
+            _recursive_update(d[k], v)
+        else:
+            d[k] = v
+    return d
+
+#########################################################
+
 def check_port_available(host, port):
     """Check if a port is available on the host"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1143,7 +1484,7 @@ def main():
 
     print_banner()
 
-    config = load_config(args.config)
+    config = load_config(config_path)
 
     if args.verbose:
         config["logging"]["level"] = "DEBUG"
