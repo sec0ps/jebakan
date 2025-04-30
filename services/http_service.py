@@ -1151,11 +1151,11 @@ class HTTPService(BaseService):
                     }
                 )
     
-            # Always return a login error page
-            self._send_login_error(client_socket, path)
+            # Always return a login error page - pass client_id
+            self._send_login_error(client_socket, path, client_id)
         else:
-            # Default handler for other POST requests
-            self._send_error(client_socket, 403, "Forbidden")
+            # Default handler for other POST requests - pass client_id
+            self._send_error(client_socket, 403, "Forbidden", client_id)
             
             # Log forbidden POST to unified logger
             if self.unified_logger:
@@ -1391,6 +1391,9 @@ class HTTPService(BaseService):
             connection_data: Dictionary to store connection data for logging
             address: Client address tuple (ip, port)
         """
+        # Get client_id from connection data
+        client_id = connection_data.get("data", {}).get("client_id")
+        
         # Log vulnerable page access to unified logger
         if self.unified_logger:
             self.unified_logger.log_attack(
@@ -1400,16 +1403,17 @@ class HTTPService(BaseService):
                 command="vulnerable_page_access",
                 additional_data={
                     "path": path,
-                    "headers": headers
+                    "headers": headers,
+                    "client_id": client_id
                 }
             )
         
         # Default response is a login form
         if path == "/admin" or path == "/phpmyadmin" or path == "/wordpress/wp-admin":
-            self._send_login_page(client_socket, path)
+            self._send_login_page(client_socket, path, client_id)
         else:
             # Default to 404 for unknown vulnerable pages
-            self._send_error(client_socket, 404, "Not Found")
+            self._send_error(client_socket, 404, "Not Found", client_id)
 
     def _send_simple_response(self, client_socket: socket.socket, status: str) -> None:
         """
@@ -1652,59 +1656,81 @@ class HTTPService(BaseService):
         """
         return script
 
-    def _send_error(self, client_socket: socket.socket, status_code: int, message: str) -> None:
+    def _send_error(self, client_socket: socket.socket, status_code: int, message: str, client_id: str = None) -> None:
         """
-        Send an HTTP error response
-
+        Send an HTTP error response with tracking cookie, fingerprinting, and honeytokens
+    
         Args:
             client_socket: Client socket object
             status_code: HTTP status code
             message: Error message
+            client_id: Client tracking ID (optional)
         """
         try:
             status_line = f"HTTP/1.1 {status_code} {message}\r\n"
             content = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>{status_code} {message}</title>
-</head>
-<body>
-    <h1>{status_code} {message}</h1>
-    <p>The requested URL was not found on this server.</p>
-    <hr>
-    <p><em>{self.server_name}</em></p>
-</body>
-</html>
-"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{status_code} {message}</title>
+    </head>
+    <body>
+        <h1>{status_code} {message}</h1>
+        <p>The requested URL was not found on this server.</p>
+        <hr>
+        <p><em>{self.server_name}</em></p>
+    </body>
+    </html>
+    """
+            # Inject honeytokens if we have a client_id
+            if client_id:
+                content = self._inject_honeytokens(content, client_id)
+                
+                # Also inject fingerprinting script
+                fingerprint_script = self._get_fingerprint_script(client_id)
+                if "</body>" in content:
+                    content = content.replace("</body>", f"{fingerprint_script}\n</body>")
+                else:
+                    content += f"\n{fingerprint_script}\n"
+    
             headers = [
                 f"Server: {self.server_name}",
                 "Content-Type: text/html; charset=utf-8",
-                f"Content-Length: {len(content)}",
+                f"Content-Length: {len(content)}"
+            ]
+            
+            # Add tracking cookie if client_id is provided
+            if client_id:
+                expiry_date = (datetime.datetime.now() + datetime.timedelta(days=365)).strftime('%a, %d %b %Y %H:%M:%S GMT')
+                cookie_header = f"Set-Cookie: HONEYPOT_ID={client_id}; Expires={expiry_date}; Path=/; HttpOnly"
+                headers.append(cookie_header)
+                
+            headers.extend([
                 f"Date: {datetime.datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT')}",
                 "Connection: close"
-            ]
-
+            ])
+    
             response = status_line + "\r\n".join(headers) + "\r\n\r\n"
             client_socket.send(response.encode())
-
+    
             # Send content
             client_socket.send(content.encode())
-
+    
         except Exception as e:
             self.logger.error(f"Error sending HTTP error: {e}")
 
-    def _send_login_page(self, client_socket: socket.socket, path: str) -> None:
+    def _send_login_page(self, client_socket: socket.socket, path: str, client_id: str = None) -> None:
         """
-        Send a fake login page
-
+        Send a fake login page with tracking cookie, fingerprinting, and honeytokens
+    
         Args:
             client_socket: Client socket object
             path: Request path
+            client_id: Client tracking ID (optional)
         """
         try:
             status_line = "HTTP/1.1 200 OK\r\n"
-
+    
             # Create a login form based on the path
             title = "Login"
             if path == "/admin":
@@ -1713,200 +1739,239 @@ class HTTPService(BaseService):
                 title = "phpMyAdmin"
             elif path == "/wordpress/wp-admin":
                 title = "WordPress Admin"
-
+    
             content = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>{title}</title>
-    <style>
-        body {{
-            font-family: Arial, sans-serif;
-            line-height: 1.6;
-            margin: 0;
-            padding: 20px;
-            color: #333;
-            background-color: #f4f4f4;
-        }}
-        h1 {{
-            color: #0066cc;
-        }}
-        .container {{
-            max-width: 400px;
-            margin: 50px auto;
-            padding: 20px;
-            background: white;
-            border-radius: 5px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-        }}
-        .form-group {{
-            margin-bottom: 15px;
-        }}
-        label {{
-            display: block;
-            margin-bottom: 5px;
-        }}
-        input[type="text"], input[type="password"] {{
-            width: 100%;
-            padding: 8px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-        }}
-        button {{
-            padding: 10px 15px;
-            background: #0066cc;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-        }}
-        button:hover {{
-            background: #0052a3;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>{title}</h1>
-        <form method="post" action="{path}">
-            <div class="form-group">
-                <label for="username">Username:</label>
-                <input type="text" id="username" name="username" required>
-            </div>
-            <div class="form-group">
-                <label for="password">Password:</label>
-                <input type="password" id="password" name="password" required>
-            </div>
-            <button type="submit">Login</button>
-        </form>
-    </div>
-</body>
-</html>
-"""
-
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{title}</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                line-height: 1.6;
+                margin: 0;
+                padding: 20px;
+                color: #333;
+                background-color: #f4f4f4;
+            }}
+            h1 {{
+                color: #0066cc;
+            }}
+            .container {{
+                max-width: 400px;
+                margin: 50px auto;
+                padding: 20px;
+                background: white;
+                border-radius: 5px;
+                box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            }}
+            .form-group {{
+                margin-bottom: 15px;
+            }}
+            label {{
+                display: block;
+                margin-bottom: 5px;
+            }}
+            input[type="text"], input[type="password"] {{
+                width: 100%;
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+            }}
+            button {{
+                padding: 10px 15px;
+                background: #0066cc;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+            }}
+            button:hover {{
+                background: #0052a3;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>{title}</h1>
+            <form method="post" action="{path}">
+                <div class="form-group">
+                    <label for="username">Username:</label>
+                    <input type="text" id="username" name="username" required>
+                </div>
+                <div class="form-group">
+                    <label for="password">Password:</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <button type="submit">Login</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+            # Inject honeytokens if we have a client_id
+            if client_id:
+                content = self._inject_honeytokens(content, client_id)
+                
+                # Also inject fingerprinting script
+                fingerprint_script = self._get_fingerprint_script(client_id)
+                if "</body>" in content:
+                    content = content.replace("</body>", f"{fingerprint_script}\n</body>")
+                else:
+                    content += f"\n{fingerprint_script}\n"
+    
             headers = [
                 f"Server: {self.server_name}",
                 "Content-Type: text/html; charset=utf-8",
-                f"Content-Length: {len(content)}",
+                f"Content-Length: {len(content)}"
+            ]
+            
+            # Add tracking cookie if client_id is provided
+            if client_id:
+                expiry_date = (datetime.datetime.now() + datetime.timedelta(days=365)).strftime('%a, %d %b %Y %H:%M:%S GMT')
+                cookie_header = f"Set-Cookie: HONEYPOT_ID={client_id}; Expires={expiry_date}; Path=/; HttpOnly"
+                headers.append(cookie_header)
+                
+            headers.extend([
                 f"Date: {datetime.datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT')}",
                 "Connection: close"
-            ]
-
+            ])
+    
             response = status_line + "\r\n".join(headers) + "\r\n\r\n"
             client_socket.send(response.encode())
-
+    
             # Send content
             client_socket.send(content.encode())
-
+    
         except Exception as e:
             self.logger.error(f"Error sending login page: {e}")
-            self._send_error(client_socket, 500, "Internal Server Error")
+            self._send_error(client_socket, 500, "Internal Server Error", client_id)
 
-    def _send_login_error(self, client_socket: socket.socket, path: str) -> None:
+    def _send_login_error(self, client_socket: socket.socket, path: str, client_id: str = None) -> None:
         """
-        Send a login error page
-
+        Send a login error page with tracking cookie, fingerprinting, and honeytokens
+    
         Args:
             client_socket: Client socket object
             path: Request path
+            client_id: Client tracking ID (optional)
         """
         try:
             status_line = "HTTP/1.1 200 OK\r\n"
-
+    
             # Create a login form with error message
             title = "Login"
             if path == "/admin/index.php":
                 title = "Admin Panel"
-
+    
             content = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>{title}</title>
-    <style>
-        body {{
-            font-family: Arial, sans-serif;
-            line-height: 1.6;
-            margin: 0;
-            padding: 20px;
-            color: #333;
-            background-color: #f4f4f4;
-        }}
-        h1 {{
-            color: #0066cc;
-        }}
-        .container {{
-            max-width: 400px;
-            margin: 50px auto;
-            padding: 20px;
-            background: white;
-            border-radius: 5px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-        }}
-        .form-group {{
-            margin-bottom: 15px;
-        }}
-        label {{
-            display: block;
-            margin-bottom: 5px;
-        }}
-        input[type="text"], input[type="password"] {{
-            width: 100%;
-            padding: 8px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-        }}
-        button {{
-            padding: 10px 15px;
-            background: #0066cc;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-        }}
-        button:hover {{
-            background: #0052a3;
-        }}
-        .error {{
-            color: red;
-            margin-bottom: 10px;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>{title}</h1>
-        <div class="error">Invalid username or password</div>
-        <form method="post" action="{path}">
-            <div class="form-group">
-                <label for="username">Username:</label>
-                <input type="text" id="username" name="username" required>
-            </div>
-            <div class="form-group">
-                <label for="password">Password:</label>
-                <input type="password" id="password" name="password" required>
-            </div>
-            <button type="submit">Login</button>
-        </form>
-    </div>
-</body>
-</html>
-"""
-
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{title}</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                line-height: 1.6;
+                margin: 0;
+                padding: 20px;
+                color: #333;
+                background-color: #f4f4f4;
+            }}
+            h1 {{
+                color: #0066cc;
+            }}
+            .container {{
+                max-width: 400px;
+                margin: 50px auto;
+                padding: 20px;
+                background: white;
+                border-radius: 5px;
+                box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            }}
+            .form-group {{
+                margin-bottom: 15px;
+            }}
+            label {{
+                display: block;
+                margin-bottom: 5px;
+            }}
+            input[type="text"], input[type="password"] {{
+                width: 100%;
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+            }}
+            button {{
+                padding: 10px 15px;
+                background: #0066cc;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+            }}
+            button:hover {{
+                background: #0052a3;
+            }}
+            .error {{
+                color: red;
+                margin-bottom: 10px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>{title}</h1>
+            <div class="error">Invalid username or password</div>
+            <form method="post" action="{path}">
+                <div class="form-group">
+                    <label for="username">Username:</label>
+                    <input type="text" id="username" name="username" required>
+                </div>
+                <div class="form-group">
+                    <label for="password">Password:</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <button type="submit">Login</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+            # Inject honeytokens if we have a client_id
+            if client_id:
+                content = self._inject_honeytokens(content, client_id)
+                
+                # Also inject fingerprinting script
+                fingerprint_script = self._get_fingerprint_script(client_id)
+                if "</body>" in content:
+                    content = content.replace("</body>", f"{fingerprint_script}\n</body>")
+                else:
+                    content += f"\n{fingerprint_script}\n"
+    
             headers = [
                 f"Server: {self.server_name}",
                 "Content-Type: text/html; charset=utf-8",
-                f"Content-Length: {len(content)}",
+                f"Content-Length: {len(content)}"
+            ]
+            
+            # Add tracking cookie if client_id is provided
+            if client_id:
+                expiry_date = (datetime.datetime.now() + datetime.timedelta(days=365)).strftime('%a, %d %b %Y %H:%M:%S GMT')
+                cookie_header = f"Set-Cookie: HONEYPOT_ID={client_id}; Expires={expiry_date}; Path=/; HttpOnly"
+                headers.append(cookie_header)
+                
+            headers.extend([
                 f"Date: {datetime.datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT')}",
                 "Connection: close"
-            ]
-
+            ])
+    
             response = status_line + "\r\n".join(headers) + "\r\n\r\n"
             client_socket.send(response.encode())
-
+    
             # Send content
             client_socket.send(content.encode())
-
+    
         except Exception as e:
             self.logger.error(f"Error sending login error page: {e}")
             self._send_error(client_socket, 500, "Internal Server Error")
