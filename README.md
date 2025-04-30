@@ -11,6 +11,7 @@
 - **Configurable Deception:** Define fake credentials, system info, breadcrumbs, and interaction levels
 - **Low Interaction to High Interaction:** Choose between fake banners, partial responses, or full protocol simulation
 - **Safe Deployment:** Fully isolated from production—ideal for DMZs, SOC labs, or dedicated decoy servers
+- **ML Enhancements:** Machine learning integrated to detect anomalous attack patterns, assign real-time risk scores, and silently flag high-priority threats for analyst review.
 
 ## Installation
 
