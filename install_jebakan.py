@@ -28,16 +28,6 @@
 #
 # =============================================================================
 #!/usr/bin/env python3
-"""
-Installer script for the Jebakan Honeypot System
-
-This script:
-1. Installs all required Python dependencies
-2. Creates a dedicated jebakan user and group
-3. Creates the /opt/jebakan directory
-4. Moves all program files to /opt/jebakan
-"""
-
 import os
 import sys
 import shutil
