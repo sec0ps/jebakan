@@ -1928,7 +1928,8 @@ def print_status(started_services, dashboard_port=None, analytics_enabled=False)
 
 def check_for_updates():
     """Check if a newer version is available, force update if needed, and exit after update"""
-    current_version_file = os.path.join(os.path.dirname(__file__), 'version.txt')
+    base_dir = os.path.dirname(__file__)
+    current_version_file = os.path.join(base_dir, 'version.txt')
     if not os.path.isfile(current_version_file):
         print("Version file not found.")
         return
@@ -1946,21 +1947,36 @@ def check_for_updates():
                 print("Pulling latest changes from GitHub...")
 
                 try:
+                    # Detect venv directory to preserve
+                    venv_dirs = ['venv', '.venv', 'env']
+                    exclude_dir = None
+                    for d in venv_dirs:
+                        full_path = os.path.join(base_dir, d)
+                        if os.path.isdir(full_path):
+                            exclude_dir = d
+                            break
+
+                    # Perform update
                     subprocess.run(["git", "reset", "--hard"], check=True)
-                    subprocess.run(["git", "clean", "-fd"], check=True)
+                    if exclude_dir:
+                        subprocess.run(["git", "clean", "-fd", "-e", exclude_dir], check=True)
+                    else:
+                        subprocess.run(["git", "clean", "-fd"], check=True)
                     subprocess.run(["git", "pull"], check=True)
 
-                    # Update version file
+                    # Update local version.txt
                     with open(current_version_file, 'w') as f:
                         f.write(latest_version + "\n")
 
                     print("Update completed successfully.")
-                    logger.info("Jebakan has updated to version %s and will now exit.", latest_version)
+                    logger.info("Jebakan updated to version %s — exiting for updates to take effect.", latest_version)
                     sys.exit(0)
+
                 except subprocess.CalledProcessError as e:
                     print(f"Git update failed: {e}")
                     logger.error("Update failed: %s", str(e))
                     sys.exit(1)
+
             else:
                 print("Jebakan is up to date.")
         else:
