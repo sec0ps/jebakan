@@ -49,7 +49,7 @@ from services.base_service import BaseService
 class MySQLService(BaseService):
     """MySQL service emulator for the honeypot"""
 
-    def __init__(self, host: str, port: int, config: Dict[str, Any]):
+    def __init__(self, host: str, port: int, config: Dict[str, Any], unified_logger=None):
         """
         Initialize the MySQL service
     
@@ -57,8 +57,12 @@ class MySQLService(BaseService):
             host: Host IP to bind to
             port: Port to listen on
             config: Global configuration dictionary
+            unified_logger: Unified logger instance for centralized logging
         """
         super().__init__(host, port, config, "mysql")
+    
+        # Store unified logger instance
+        self.unified_logger = unified_logger
     
         # MySQL specific configurations
         self.server_version = self.service_config.get("server_version", "5.7.34-log")
@@ -73,6 +77,11 @@ class MySQLService(BaseService):
                      connection_data: Dict[str, Any]) -> None:
         """
         Handle a client connection to the MySQL service
+    
+        Args:
+            client_socket: Client socket object
+            address: Client address tuple (ip, port)
+            connection_data: Dictionary to store connection data for logging
         """
         # Increment connection ID
         self.connection_id += 1
@@ -80,10 +89,36 @@ class MySQLService(BaseService):
     
         # Record initial connection timestamp
         connection_data["data"]["connection_time"] = datetime.datetime.now().isoformat()
+        
+        # Log connection attempt to unified logger
+        if self.unified_logger:
+            self.unified_logger.log_attack(
+                service="mysql",
+                attacker_ip=address[0],
+                attacker_port=address[1],
+                command="connection_attempt",
+                additional_data={
+                    "connection_id": connection_id,
+                    "timestamp": datetime.datetime.now().isoformat()
+                }
+            )
     
         try:
             # Send server greeting
             self._send_server_greeting(client_socket)
+            
+            # Log server greeting to unified logger
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="mysql",
+                    attacker_ip=address[0],
+                    attacker_port=address[1],
+                    command="mysql_greeting_sent",
+                    additional_data={
+                        "connection_id": connection_id,
+                        "server_version": self.server_version
+                    }
+                )
     
             # Receive authentication response
             auth_response = self._receive_packet(client_socket)
@@ -106,10 +141,37 @@ class MySQLService(BaseService):
             connection_data["data"]["auth_attempts"].append(auth_data)
     
             self.logger.info(f"MySQL authentication attempt from {address[0]} with username '{username}'")
+            
+            # Log authentication attempt to unified logger
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="mysql",
+                    attacker_ip=address[0],
+                    attacker_port=address[1],
+                    command="login_attempt",
+                    additional_data={
+                        "username": username,
+                        "password_hash": self._get_password_hash(password) if password else None,
+                        "connection_id": connection_id
+                    }
+                )
     
             # Always allow authentication for honeypot purposes
             self._send_auth_result(client_socket, True)
             self.logger.info(f"MySQL authentication successful for user '{username}' from {address[0]}")
+            
+            # Log successful authentication to unified logger
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="mysql",
+                    attacker_ip=address[0],
+                    attacker_port=address[1],
+                    command="login_success",
+                    additional_data={
+                        "username": username,
+                        "connection_id": connection_id
+                    }
+                )
             
             # Handle MySQL commands after successful auth
             self._handle_mysql_commands(client_socket, address, connection_data)
@@ -117,6 +179,19 @@ class MySQLService(BaseService):
         except Exception as e:
             self.logger.error(f"Error handling MySQL client: {e}")
             connection_data["error"] = str(e)
+            
+            # Log error to unified logger
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="mysql",
+                    attacker_ip=address[0],
+                    attacker_port=address[1],
+                    command="error",
+                    additional_data={
+                        "error": str(e),
+                        "connection_id": connection_id
+                    }
+                )
         finally:
             client_socket.close()
 
@@ -389,6 +464,11 @@ class MySQLService(BaseService):
                               connection_data: Dict[str, Any]) -> None:
         """
         Handle MySQL commands after successful authentication
+        
+        Args:
+            client_socket: Client socket object
+            address: Client address tuple (ip, port)
+            connection_data: Dictionary to store connection data for logging
         """
         while True:
             try:
@@ -411,6 +491,35 @@ class MySQLService(BaseService):
                         "query": query
                     })
                     
+                    # Log query to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="mysql",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command="mysql_query",
+                            additional_data={
+                                "query": query,
+                                "timestamp": datetime.datetime.now().isoformat()
+                            }
+                        )
+                    
+                    # Check for sensitive queries and log them specially
+                    lower_query = query.lower()
+                    if "password" in lower_query or "authentication_string" in lower_query or "user" in lower_query:
+                        if self.unified_logger:
+                            self.unified_logger.log_attack(
+                                service="mysql",
+                                attacker_ip=address[0],
+                                attacker_port=address[1],
+                                command="sensitive_query",
+                                additional_data={
+                                    "query": query,
+                                    "sensitivity": "high",
+                                    "reason": "password_access"
+                                }
+                            )
+                    
                     # Handle specific queries for hashdump
                     if "@@version" in query.lower():
                         self._send_query_result(client_socket, [["5.7.34-log"]], ["@@version"])
@@ -427,6 +536,19 @@ class MySQLService(BaseService):
                             ["finance", "*2AC9CB7DC02B3C0083EB70898E549B63"],  # hash for 'money'
                         ]
                         self._send_query_result(client_socket, rows, columns)
+                        
+                        # Log password hash dump to unified logger
+                        if self.unified_logger:
+                            self.unified_logger.log_attack(
+                                service="mysql",
+                                attacker_ip=address[0],
+                                attacker_port=address[1],
+                                command="password_hash_dump",
+                                additional_data={
+                                    "query": query,
+                                    "users_count": len(rows)
+                                }
+                            )
                     elif "select user,password from mysql.user" in query.lower():
                         # Legacy MySQL uses password column
                         columns = ["user", "password"]
@@ -438,8 +560,21 @@ class MySQLService(BaseService):
                             ["web", "*97E7471D816A37E38510728AEA47440F9C6E2585"],  # hash for 'web123'
                         ]
                         self._send_query_result(client_socket, rows, columns)
+                        
+                        # Log password hash dump to unified logger
+                        if self.unified_logger:
+                            self.unified_logger.log_attack(
+                                service="mysql",
+                                attacker_ip=address[0],
+                                attacker_port=address[1],
+                                command="password_hash_dump",
+                                additional_data={
+                                    "query": query,
+                                    "users_count": len(rows)
+                                }
+                            )
                     elif "show databases" in query.lower():
-                        self._send_query_result(client_socket, [
+                        databases = [
                             ["information_schema"], 
                             ["mysql"], 
                             ["performance_schema"], 
@@ -449,15 +584,41 @@ class MySQLService(BaseService):
                             ["customers"],
                             ["finance"],
                             ["hr"]
-                        ], ["Database"])
+                        ]
+                        self._send_query_result(client_socket, databases, ["Database"])
+                        
+                        # Log database enumeration to unified logger
+                        if self.unified_logger:
+                            self.unified_logger.log_attack(
+                                service="mysql",
+                                attacker_ip=address[0],
+                                attacker_port=address[1],
+                                command="database_enumeration",
+                                additional_data={
+                                    "databases": [db[0] for db in databases]
+                                }
+                            )
                     elif "show tables" in query.lower():
-                        self._send_query_result(client_socket, [
+                        tables = [
                             ["users"], 
                             ["credentials"], 
                             ["payments"], 
                             ["accounts"],
                             ["sensitive_data"]
-                        ], ["Tables_in_mysql"])
+                        ]
+                        self._send_query_result(client_socket, tables, ["Tables_in_mysql"])
+                        
+                        # Log table enumeration to unified logger
+                        if self.unified_logger:
+                            self.unified_logger.log_attack(
+                                service="mysql",
+                                attacker_ip=address[0],
+                                attacker_port=address[1],
+                                command="table_enumeration",
+                                additional_data={
+                                    "tables": [table[0] for table in tables]
+                                }
+                            )
                     elif "select" in query.lower() and "from" in query.lower():
                         # Generic select query - send empty result
                         self._send_query_result(client_socket, [], ["column1"])
@@ -466,15 +627,62 @@ class MySQLService(BaseService):
                         self._send_ok_packet(client_socket)
                         
                 elif cmd_type == 0x01:  # COM_QUIT
+                    # Log quit command to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="mysql",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command="mysql_quit",
+                            additional_data={
+                                "timestamp": datetime.datetime.now().isoformat()
+                            }
+                        )
                     break
                 elif cmd_type == 0x02:  # COM_INIT_DB
+                    db_name = cmd_packet[1:].decode('utf-8', errors='ignore')
+                    # Log database initialization to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="mysql",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command="mysql_init_db",
+                            additional_data={
+                                "database": db_name
+                            }
+                        )
                     self._send_ok_packet(client_socket)
                 else:
+                    # Log unknown command to unified logger
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="mysql",
+                            attacker_ip=address[0],
+                            attacker_port=address[1],
+                            command="mysql_unknown_command",
+                            additional_data={
+                                "command_type": cmd_type,
+                                "raw_data": cmd_packet.hex()[:100]  # First 100 chars to avoid bloat
+                            }
+                        )
                     # Send OK packet for unknown commands
                     self._send_ok_packet(client_socket)
                     
             except Exception as e:
                 self.logger.error(f"Error handling MySQL command: {e}")
+                # Log error to unified logger
+                if self.unified_logger:
+                    self.unified_logger.log_attack(
+                        service="mysql",
+                        attacker_ip=address[0],
+                        attacker_port=address[1],
+                        command="error",
+                        additional_data={
+                            "error": str(e),
+                            "context": "command_handling"
+                        }
+                    )
                 break
     
     def _send_ok_packet(self, client_socket: socket.socket, sequence_id: int = 1) -> None:
@@ -488,3 +696,76 @@ class MySQLService(BaseService):
         data.extend(struct.pack("<H", 0x0002))  # Server status
         data.extend(struct.pack("<H", 0))  # Warnings
         self._send_packet(client_socket, data, sequence_id)
+
+    def start(self) -> None:
+        """Start the MySQL service"""
+        try:
+            self.sock.bind((self.host, self.port))
+            self.sock.listen(5)
+            self.running = True
+            
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="mysql",
+                    attacker_ip="system",
+                    attacker_port=0,
+                    command="service_start",
+                    additional_data={"port": self.port}
+                )
+            
+            self.logger.info(f"MySQL honeypot started on port {self.port}")
+            
+            while self.running:
+                try:
+                    client, addr = self.sock.accept()
+                    
+                    # Set a timeout for the client socket
+                    client.settimeout(self.config["resource_limits"]["connection_timeout"])
+                    
+                    # Check if we've reached the maximum connections
+                    if self.connection_count >= self.config["network"]["max_connections"]:
+                        self.logger.warning(f"Maximum connections reached, dropping connection from {addr[0]}")
+                        client.close()
+                        continue
+                    
+                    # Increment connection counters
+                    self.connection_count += 1
+                    self._increment_ip_counter(addr[0])
+                    
+                    # Log the connection
+                    self.logger.info(f"Connection from {addr[0]}:{addr[1]} to MySQL service")
+                    
+                    # Start a new thread to handle the client
+                    client_handler = threading.Thread(
+                        target=self._handle_client_wrapper,
+                        args=(client, addr)
+                    )
+                    client_handler.daemon = True
+                    client_handler.start()
+                    
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    if self.unified_logger:
+                        self.unified_logger.log_attack(
+                            service="mysql",
+                            attacker_ip="error",
+                            attacker_port=0,
+                            command="error",
+                            additional_data={"error": str(e)}
+                        )
+                    self.logger.error(f"Error accepting connection: {e}")
+                    
+        except Exception as e:
+            if self.unified_logger:
+                self.unified_logger.log_attack(
+                    service="mysql",
+                    attacker_ip="error",
+                    attacker_port=0,
+                    command="service_error",
+                    additional_data={"error": str(e)}
+                )
+            self.logger.error(f"Error starting MySQL service: {e}")
+        finally:
+            if self.sock:
+                self.sock.close()
