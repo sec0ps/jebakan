@@ -43,7 +43,6 @@ import re
 import copy
 import joblib
 import requests
-import geoip2.database
 import subprocess
 from packaging import version
 from collections import defaultdict, Counter
@@ -183,26 +182,21 @@ def cleanup_services(active_services):
             
     print(f"{Fore.GREEN}Services cleaned up successfully{Style.RESET_ALL}")
 
-def check_port_available(host, port):
-    """Check if a port is available on the host"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind((host, port))
-            s.close()
-            return True
-        except OSError:
-            return False
-
 class UnifiedLogger:
     """Unified logger for all honeypot activities with SIEM integration and geolocation"""
     
     def __init__(self, config: Dict[str, Any]):
+        """Initialize unified logger for all honeypot activities with SIEM integration and geolocation"""
         self.config = config
         self.logger = logging.getLogger("unified_logger")
         self.log_dir = config.get("logging", {}).get("dir", "logs/")
         self.unified_log_file = os.path.join(self.log_dir, "honeypot_attacks.json")
         self.siem_config = config.get("siem-server", None)
-        self.geoip_db_path = config.get("geoip_db_path", "GeoLite2-City.mmdb")
+        
+        # Replace geoip_db_path with ipgeolocation API key
+        self.geo_api_key = config.get("network", {}).get("geo_api_key", None)
+        self.geo_api_url = "https://api.ipgeolocation.io/v2/ipgeo"
+        
         self.siem_position_file = os.path.join(self.log_dir, "siem_last_position.txt")
         self.siem_queue_file = os.path.join(self.log_dir, "siem_queue.json")
         
@@ -225,15 +219,12 @@ class UnifiedLogger:
             with open(self.siem_queue_file, 'w') as f:
                 f.write("[]")
         
-        # Load GeoIP database if available
-        self.geoip_reader = None
-        if os.path.exists(self.geoip_db_path):
-            try:
-                self.geoip_reader = geoip2.database.Reader(self.geoip_db_path)
-                self.logger.info("GeoIP database loaded successfully.")
-            except Exception as e:
-                self.logger.error(f"Failed to load GeoIP database: {e}")
-    
+        # Log API key status
+        if self.geo_api_key:
+            self.logger.info("Geolocation API key configured successfully.")
+        else:
+            self.logger.warning("No Geolocation API key found. Geolocation enrichment will be disabled.")
+            
         if self.siem_config:
             # Start with a connection test
             self._check_siem_connection()
@@ -307,19 +298,11 @@ class UnifiedLogger:
             "command": command
         }
     
-        # Add geolocation enrichment
-        if self.geoip_reader:
-            try:
-                response = self.geoip_reader.city(attacker_ip)
-                geo_info = {
-                    "country": response.country.name,
-                    "city": response.city.name,
-                    "asn": response.traits.autonomous_system_organization,
-                    "isp": response.traits.isp,
-                }
-                log_entry["geolocation"] = {k: v for k, v in geo_info.items() if v}
-            except Exception:
-                log_entry["geolocation"] = {}
+        # Add geolocation enrichment using the API instead of geoip2 database
+        if attacker_ip and attacker_ip != "0.0.0.0" and attacker_ip != "127.0.0.1":
+            geo_info = self._get_geolocation(attacker_ip)
+            if geo_info:
+                log_entry["geolocation"] = geo_info
     
         # Add additional data if provided
         if additional_data:
@@ -373,7 +356,102 @@ class UnifiedLogger:
                     
             except Exception as e:
                 self.ml_logger.error(f"Error in ML processing: {e}")
+
+    def _get_geolocation(self, ip_address: str) -> Dict[str, Any]:
+        """
+        Get geolocation data for an IP address using the ipgeolocation.io API
+        
+        Args:
+            ip_address: The IP address to look up
+        
+        Returns:
+            Dictionary containing geolocation data or empty dict if lookup failed
+        """
+        if not self.geo_api_key:
+            self.logger.debug("No geolocation API key configured. Skipping geolocation lookup.")
+            return {}
+        
+        # Validate IP address format
+        if not ip_address:
+            self.logger.warning("Empty IP address provided for geolocation lookup")
+            return {}
+            
+        # Check if it's a valid IP address
+        try:
+            socket.inet_aton(ip_address)  # This will raise an error if IP is invalid
+        except (socket.error, TypeError):
+            self.logger.warning(f"Invalid IP address format: '{ip_address}'. Skipping geolocation lookup.")
+            return {}
+        
+        # Don't try to geolocate private or local IPs
+        if (ip_address == "127.0.0.1" or 
+            ip_address == "0.0.0.0" or 
+            ip_address.startswith("192.168.") or 
+            ip_address.startswith("10.") or
+            ip_address.startswith("172.16.")):
+            self.logger.debug(f"Skipping geolocation for private IP: {ip_address}")
+            return {}
+        
+        try:
+            params = {
+                'apiKey': self.geo_api_key,
+                'ip': ip_address
+            }
+            
+            self.logger.debug(f"Making geolocation API request for IP {ip_address}")
+            response = requests.get(self.geo_api_url, params=params, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Extract relevant fields from the API response
+                geo_info = {
+                    "country": data.get("country_name"),
+                    "city": data.get("city"),
+                    "asn": data.get("asn", {}).get("organization"),
+                    "isp": data.get("isp"),
+                    "latitude": data.get("latitude"),
+                    "longitude": data.get("longitude"),
+                    "timezone": data.get("time_zone", {}).get("name")
+                }
+                
+                # Filter out None values
+                return {k: v for k, v in geo_info.items() if v}
+            elif response.status_code == 401:
+                self.logger.error(f"Authentication failed with geolocation API for IP {ip_address}. Check your API key.")
+                # To avoid spam, disable further lookups temporarily
+                self._temp_disable_geolocation()
+                return {}
+            elif response.status_code == 429:
+                self.logger.warning(f"Rate limit exceeded with geolocation API. Will retry later.")
+                # To avoid spam, disable further lookups temporarily
+                self._temp_disable_geolocation()
+                return {}
+            else:
+                self.logger.warning(f"Geolocation API returned status {response.status_code} for IP {ip_address}")
+                return {}
+                    
+        except Exception as e:
+            self.logger.error(f"Error during geolocation lookup for {ip_address}: {e}")
+            return {}
     
+    def _temp_disable_geolocation(self):
+        """Temporarily disable geolocation lookups to avoid repeated API errors"""
+        self.logger.warning("Temporarily disabling geolocation lookups due to API errors")
+        # Store the original API key and temporarily set to None
+        self._original_geo_api_key = self.geo_api_key
+        self.geo_api_key = None
+        
+        # Set a timer to restore the API key after a cooldown period
+        def restore_api_key():
+            time.sleep(300)  # 5 minute cooldown
+            self.geo_api_key = self._original_geo_api_key
+            self.logger.info("Geolocation lookups re-enabled after cooldown period")
+        
+        # Start a background thread to restore the API key later
+        restore_thread = threading.Thread(target=restore_api_key, daemon=True)
+        restore_thread.start()
+
     def _load_last_position(self) -> int:
         """Load the last position sent to SIEM from file"""
         try:
@@ -896,6 +974,86 @@ class UnifiedLogger:
             # Sleep before next check
             time.sleep(60)  # Check every minute
 
+def configure_geolocation(config_path):
+    """Configure geolocation API integration via interactive prompt"""
+    try:
+        # Load current configuration
+        config = load_config(config_path)
+        
+        print(f"\n{Fore.CYAN}=== Geolocation API Configuration ==={Style.RESET_ALL}")
+        print("This will configure the connection to ipgeolocation.io API.")
+        print("You need an API key from https://ipgeolocation.io/")
+        
+        # Get API key
+        api_key = input("Enter your ipgeolocation.io API key: ").strip()
+        
+        if api_key:
+            # Ensure the network section exists in config
+            if "network" not in config:
+                config["network"] = {"bind_ip": "0.0.0.0", "max_connections": 100}
+            
+            # Test the API key with a sample request
+            try:
+                print(f"{Fore.YELLOW}Testing API key...{Style.RESET_ALL}")
+                response = requests.get(
+                    "https://api.ipgeolocation.io/v2/ipgeo",
+                    params={"apiKey": api_key, "ip": "8.8.8.8"},
+                    timeout=5
+                )
+                
+                if response.status_code == 200:
+                    print(f"{Fore.GREEN}API key tested successfully!{Style.RESET_ALL}")
+                    
+                    # Show a sample of the data
+                    data = response.json()
+                    print(f"\nSample geolocation data for 8.8.8.8:")
+                    print(f"Country: {data.get('country_name', 'N/A')}")
+                    print(f"City: {data.get('city', 'N/A')}")
+                    print(f"ISP: {data.get('isp', 'N/A')}")
+                    
+                    # Update configuration
+                    config["network"]["geo_api_key"] = api_key
+                    
+                    # Save the updated configuration
+                    if save_config(config, config_path):
+                        print(f"{Fore.GREEN}Geolocation API configuration saved successfully.{Style.RESET_ALL}")
+                        print(f"The honeypot will use ipgeolocation.io API for IP enrichment")
+                    else:
+                        print(f"{Fore.RED}Failed to save geolocation API configuration.{Style.RESET_ALL}")
+                elif response.status_code == 401:
+                    print(f"{Fore.RED}Authentication failed. The API key appears to be invalid.{Style.RESET_ALL}")
+                    print("Please check your API key and try again.")
+                elif response.status_code == 429:
+                    print(f"{Fore.YELLOW}Rate limit exceeded. The API key is valid but has exceeded its rate limit.{Style.RESET_ALL}")
+                    config["network"]["geo_api_key"] = api_key
+                    if save_config(config, config_path):
+                        print(f"{Fore.GREEN}Geolocation API configuration saved despite rate limit.{Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.RED}Failed to save geolocation API configuration.{Style.RESET_ALL}")
+                else:
+                    print(f"{Fore.YELLOW}Warning: API key test returned status code {response.status_code}{Style.RESET_ALL}")
+                    print("Do you want to save this API key anyway? (y/N)")
+                    if input().strip().lower() == 'y':
+                        config["network"]["geo_api_key"] = api_key
+                        if save_config(config, config_path):
+                            print(f"{Fore.GREEN}Geolocation API configuration saved.{Style.RESET_ALL}")
+                        else:
+                            print(f"{Fore.RED}Failed to save geolocation API configuration.{Style.RESET_ALL}")
+            except Exception as e:
+                print(f"{Fore.YELLOW}Warning: Could not test API key: {e}{Style.RESET_ALL}")
+                print("Do you want to save this API key anyway? (y/N)")
+                if input().strip().lower() == 'y':
+                    config["network"]["geo_api_key"] = api_key
+                    if save_config(config, config_path):
+                        print(f"{Fore.GREEN}Geolocation API configuration saved without testing.{Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.RED}Failed to save geolocation API configuration.{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}No API key provided. Geolocation enrichment will be disabled.{Style.RESET_ALL}")
+            
+    except Exception as e:
+        print(f"{Fore.RED}Error configuring geolocation API: {e}{Style.RESET_ALL}")
+
 def configure_siem(config_path):
     """Configure SIEM integration via interactive prompt"""
     try:
@@ -1067,108 +1225,6 @@ def print_service_menu(config):
     print(f"\n{Fore.YELLOW}Additional options:")
     print(f"{Fore.CYAN}S. {Fore.WHITE}Configure SIEM")
     print(f"{Fore.CYAN}Q. {Fore.WHITE}Quit\n")
-
-def main():
-    global logger, running
-
-    parser = argparse.ArgumentParser(description="Python Honeypot System")
-    parser.add_argument("-c", "--config", help="Path to configuration file", default="config/honeypot.json")
-    parser.add_argument("-v", "--verbose", help="Increase output verbosity", action="store_true")
-    parser.add_argument("-n", "--no-prompt", help="Start with default services (no interactive prompt)", action="store_true")
-    parser.add_argument("--interaction", choices=["low", "medium", "high"], help="Set global interaction level for all services")
-    parser.add_argument("--services", help="Comma-separated list of services to enable or 'all'", type=str)
-    parser.add_argument("--config-siem", action="store_true", help="Configure SIEM integration")
-    parser.add_argument("-d", "--daemon", action="store_true", help="Run as background daemon")
-    parser.add_argument("--stop", action="store_true", help="Stop the running daemon")
-
-    args = parser.parse_args()
-
-    # Handle stop request
-    if args.stop:
-        stop_daemon()
-        return
-
-    # Handle SIEM configuration standalone
-    if args.config_siem:
-        configure_siem(args.config)
-        return
-
-    # Create necessary directories before daemonizing
-    if not os.path.exists(os.path.join(base_dir, "logs")):
-        try:
-            os.makedirs(os.path.join(base_dir, "logs"), exist_ok=True)
-        except PermissionError:
-            print(f"Warning: Permission denied when creating logs directory at {os.path.join(base_dir, 'logs')}")
-            
-    if not os.path.exists(os.path.join(base_dir, "config")):
-        try:
-            os.makedirs(os.path.join(base_dir, "config"), exist_ok=True)
-        except PermissionError:
-            print(f"Warning: Permission denied when creating config directory at {os.path.join(base_dir, 'config')}")
-
-    # Daemonize early, before any output
-    if args.daemon:
-        daemonize()
-
-    print_banner()
-
-    config = load_config(config_path)
-
-    if args.verbose:
-        config["logging"]["level"] = "DEBUG"
-        config["logging"]["console"] = True
-
-    if args.interaction:
-        config["global_interaction_level"] = args.interaction
-        for svc in config.get("services", {}).values():
-            svc["interaction_level"] = args.interaction
-            
-    # Ensure log directory path is absolute
-    if "logging" in config and "dir" in config["logging"]:
-        if not os.path.isabs(config["logging"]["dir"]):
-            config["logging"]["dir"] = os.path.join(base_dir, config["logging"]["dir"])
-
-    logger = setup_logging(config)
-    logger.info("Starting honeypot system...")
-
-    unified_logger = self.logger(config)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # Select services
-    service_map = [
-        "ssh", "http", "ftp", "telnet", "mysql", "mssql",
-        "rdp", "vnc", "redis", "elasticsearch", "docker"
-    ]
-
-    if args.no_prompt or args.services:
-        if args.services:
-            cleaned = args.services.strip().lower()
-            services_to_enable = service_map if cleaned == "all" else [s for s in cleaned.split(',') if s in service_map]
-        else:
-            services_to_enable = [s for s, scfg in config["services"].items() if scfg.get("enabled")]
-    else:
-        result = select_services(config, args)
-        if not result:
-            print(f"{Fore.YELLOW}Exiting...")
-            return
-        services_to_enable = result
-
-    started_services = start_services(config, services_to_enable, unified_logger)
-
-    if args.interaction:
-        save_config(config, args.config)
-
-    print_status(started_services)
-    logger.info(f"Honeypot started with {len(started_services)} service(s)")
-
-    try:
-        while running:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        running = False
-        logger.info("Shutting down honeypot...")
 
 def print_status(started_services):
     """Print the status of started services"""
@@ -1624,7 +1680,8 @@ def start_services(config, services_to_enable, unified_logger=None):
 DEFAULT_CONFIG = {
     "network": {
         "bind_ip": "0.0.0.0",
-        "max_connections": 100
+        "max_connections": 100,
+        "geo_api_key": ""  # Add this line for the ipgeolocation.io API key
     },
     "services": {
         "ssh": {
@@ -1794,12 +1851,6 @@ DEFAULT_CONFIG = {
             "time_window": 60  # In seconds
         }
     },
-    "dashboard": {
-        "enabled": True,
-        "port": 8000,
-        "username": "admin",
-        "password": "honeypot"
-    },
     "deception": {
         "fake_filesystem": {
             "enabled": True,
@@ -1893,8 +1944,6 @@ def _recursive_update(d: Dict[str, Any], u: Dict[str, Any]) -> Dict[str, Any]:
             d[k] = v
     return d
 
-#########################################################
-
 def check_port_available(host, port):
     """Check if a port is available on the host"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1904,27 +1953,6 @@ def check_port_available(host, port):
             return True
         except OSError:
             return False
-
-def print_status(started_services, dashboard_port=None, analytics_enabled=False):
-    """Print the status of started services"""
-    if not started_services and not dashboard_port and not analytics_enabled:
-        print(f"\n{Fore.RED}No services were started.")
-        return
-
-    print(f"\n{Fore.GREEN}=== Honeypot Status ===")
-    print(f"{Fore.CYAN}The following services are running:")
-
-    for service, port in started_services:
-        print(f"  {Fore.GREEN}✓ {service} on port {port}")
-
-    if dashboard_port:
-        print(f"  {Fore.GREEN}✓ Dashboard on port {dashboard_port} (http://localhost:{dashboard_port})")
-
-    if analytics_enabled:
-        print(f"  {Fore.GREEN}✓ Analytics engine is running")
-
-    print(f"\n{Fore.YELLOW}Press Ctrl+C to stop the honeypot.")
-    print(f"{Style.RESET_ALL}")
 
 def check_for_updates():
     """Check if a newer version is available, force update if needed, and exit after update"""
@@ -1985,31 +2013,28 @@ def check_for_updates():
         print(f"Update check error: {e}")
         logger.warning("Update check failed: %s", str(e))
 
-def force_git_update():
-    try:
-        subprocess.run(["git", "reset", "--hard"], check=True)
-        subprocess.run(["git", "clean", "-fd"], check=True)
-        subprocess.run(["git", "pull"], check=True)
-        print("Forced update completed.")
-    except subprocess.CalledProcessError as e:
-        print(f"Update failed: {e}")
-
 def main():
     global logger, running
     
     check_for_updates()
 
     parser = argparse.ArgumentParser(description="Python Honeypot System")
-    parser.add_argument("-c", "--config", help="Path to configuration file", default="config/honeypot.json")
+    parser.add_argument("-c", "--config", help="Path to configuration file", 
+                        default=os.path.join(base_dir, "config", "honeypot.json"))
     parser.add_argument("-v", "--verbose", help="Increase output verbosity", action="store_true")
     parser.add_argument("-n", "--no-prompt", help="Start with default services (no interactive prompt)", action="store_true")
     parser.add_argument("--interaction", choices=["low", "medium", "high"], help="Set global interaction level for all services")
     parser.add_argument("--services", help="Comma-separated list of services to enable or 'all'", type=str)
     parser.add_argument("--config-siem", action="store_true", help="Configure SIEM integration")
+    parser.add_argument("--config-geo", action="store_true", help="Configure ipgeolocation.io API integration")
     parser.add_argument("-d", "--daemon", action="store_true", help="Run as background daemon")
     parser.add_argument("--stop", action="store_true", help="Stop the running daemon")
 
     args = parser.parse_args()
+
+    # Convert relative config path to absolute path if needed
+    if not os.path.isabs(args.config):
+        args.config = os.path.join(base_dir, args.config)
 
     # Handle stop request
     if args.stop:
@@ -2020,6 +2045,24 @@ def main():
     if args.config_siem:
         configure_siem(args.config)
         return
+        
+    # Handle geolocation API configuration standalone
+    if args.config_geo:
+        configure_geolocation(args.config)
+        return
+
+    # Create necessary directories before daemonizing
+    if not os.path.exists(os.path.join(base_dir, "logs")):
+        try:
+            os.makedirs(os.path.join(base_dir, "logs"), exist_ok=True)
+        except PermissionError:
+            print(f"Warning: Permission denied when creating logs directory at {os.path.join(base_dir, 'logs')}")
+            
+    if not os.path.exists(os.path.dirname(args.config)):
+        try:
+            os.makedirs(os.path.dirname(args.config), exist_ok=True)
+        except PermissionError:
+            print(f"Warning: Permission denied when creating config directory at {os.path.dirname(args.config)}")
 
     # Daemonize early, before any output
     if args.daemon:
@@ -2027,7 +2070,7 @@ def main():
 
     print_banner()
 
-    config = load_config(config_path)
+    config = load_config(args.config)  # Use the resolved config path
 
     if args.verbose:
         config["logging"]["level"] = "DEBUG"
@@ -2037,9 +2080,15 @@ def main():
         config["global_interaction_level"] = args.interaction
         for svc in config.get("services", {}).values():
             svc["interaction_level"] = args.interaction
+            
+    # Ensure log directory path is absolute
+    if "logging" in config and "dir" in config["logging"]:
+        if not os.path.isabs(config["logging"]["dir"]):
+            config["logging"]["dir"] = os.path.join(base_dir, config["logging"]["dir"])
 
     logger = setup_logging(config)
     logger.info("Starting honeypot system...")
+    logger.info(f"Using configuration file: {args.config}")
 
     unified_logger = UnifiedLogger(config)
 
@@ -2070,6 +2119,11 @@ def main():
     if args.interaction:
         save_config(config, args.config)
 
+    # Check if geolocation API key is configured
+    if not config.get("network", {}).get("geo_api_key"):
+        print(f"{Fore.YELLOW}Warning: No geolocation API key configured. IP geolocation enrichment will be disabled.")
+        print(f"To configure, run with --config-geo option.{Style.RESET_ALL}")
+
     print_status(started_services)
     logger.info(f"Honeypot started with {len(started_services)} service(s)")
 
@@ -2079,6 +2133,12 @@ def main():
     except KeyboardInterrupt:
         running = False
         logger.info("Shutting down honeypot...")
-
+        
+    # Clean up services before exit
+    cleanup_services(active_services)
+    
+    if os.path.exists(PID_FILE):
+        os.remove(PID_FILE)
+        
 if __name__ == "__main__":
     main()
