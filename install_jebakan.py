@@ -28,6 +28,16 @@
 #
 # =============================================================================
 #!/usr/bin/env python3
+"""
+Installer script for the Jebakan Honeypot System
+
+This script:
+1. Creates a dedicated jebakan user and group
+2. Creates the /opt/jebakan directory
+3. Moves all program files to /opt/jebakan
+4. Installs all required Python dependencies
+"""
+
 import os
 import sys
 import shutil
@@ -44,16 +54,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger('jebakan-installer')
 
-# Import required modules
-import os
-import sys
-import shutil
-import subprocess
-import pwd
-import grp
-import logging
-from pathlib import Path
-
 # Installation directory
 INSTALL_DIR = '/opt/jebakan'
 USER_NAME = 'jebakan'
@@ -63,20 +63,20 @@ def install_jebakan():
     """Install Jebakan Honeypot"""
     logger.info("Starting Jebakan installation...")
     
-    # Install dependencies
-    install_dependencies()
-    
-    # Create user and group
+    # Create user and group - FIRST
     create_user_and_group()
     
     # Set up installation directory
     setup_installation_directory()
     
-    # Copy program files
+    # Copy program files - SECOND
     copy_program_files()
     
     # Create log directory
     create_log_directory()
+    
+    # Install dependencies - THIRD
+    install_dependencies()
     
     # Create systemd service
     create_systemd_service()
@@ -92,36 +92,6 @@ def check_root():
         logger.error("This script must be run as root")
         sys.exit(1)
     logger.info("Running with root privileges")
-
-def install_dependencies():
-    """Install required Python dependencies from requirements.txt"""
-    logger.info("Installing Python dependencies from requirements.txt...")
-    
-    # Get current directory
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    requirements_file = os.path.join(current_dir, "requirements.txt")
-    
-    # Check if requirements.txt exists
-    if not os.path.isfile(requirements_file):
-        logger.error("requirements.txt file not found in the current directory")
-        logger.error("Please create a requirements.txt file with your dependencies")
-        sys.exit(1)
-    
-    try:
-        # Make sure pip is up to date
-        logger.info("Upgrading pip...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], 
-                       check=True)
-        
-        # Install dependencies from requirements.txt
-        logger.info(f"Installing dependencies from {requirements_file}...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-r", requirements_file], 
-                      check=True)
-            
-        logger.info("All dependencies installed successfully")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to install dependencies: {e}")
-        sys.exit(1)
 
 def create_user_and_group():
     """Create the jebakan user and group if they don't exist"""
@@ -236,6 +206,35 @@ def create_log_directory():
     # Set permissions (0755 = rwxr-xr-x)
     os.chmod(log_dir, 0o755)
     logger.info("Created and configured logs directory")
+
+def install_dependencies():
+    """Install required Python dependencies from requirements.txt"""
+    logger.info("Installing Python dependencies from requirements.txt...")
+    
+    # Look for requirements.txt in the installation directory now
+    requirements_file = os.path.join(INSTALL_DIR, "requirements.txt")
+    
+    # Check if requirements.txt exists
+    if not os.path.isfile(requirements_file):
+        logger.error("requirements.txt file not found in the installation directory")
+        logger.error("Please create a requirements.txt file with your dependencies")
+        sys.exit(1)
+    
+    try:
+        # Make sure pip is up to date
+        logger.info("Upgrading pip...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], 
+                       check=True)
+        
+        # Install dependencies from requirements.txt
+        logger.info(f"Installing dependencies from {requirements_file}...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-r", requirements_file], 
+                      check=True)
+            
+        logger.info("All dependencies installed successfully")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to install dependencies: {e}")
+        sys.exit(1)
 
 def uninstall_jebakan():
     """Uninstall Jebakan Honeypot"""
