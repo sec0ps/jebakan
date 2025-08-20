@@ -1,4 +1,4 @@
-# Jebakan: Python Honeypot System (Community Edition)
+# Jebakan: Python Honeypot System
 
 **Jebakan** is a modular, service-rich honeypot platform built to detect, deceive, and document attacker behavior in real time. Designed by Red Cell Security, this Python-based system emulates real-world services across multiple protocols, enabling threat intelligence collection without exposing production assets.
 
